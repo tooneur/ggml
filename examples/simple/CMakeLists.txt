@@ -1,4 +1,6 @@
-#
+#cmake ..
+#make -j
+
 # simple-ctx
 
 set(TEST_TARGET simple-ctx)

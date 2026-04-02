@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "common-ggml.h"
+#include "../../modular_engine/parser.h"
 
 #include <cassert>
 #include <cmath>
@@ -774,6 +775,8 @@ int main(int argc, char ** argv) {
         int n_tokens = std::min(model.hparams.n_ctx, params.n_batch);
         int n_past = model.hparams.n_ctx - n_tokens;
         struct ggml_cgraph * gf = gpt2_graph(model, n_past, n_tokens);
+        ggml_graph_print(gf);
+        ggml_graph_dump_dot(gf, NULL, "ref.dot");
 
         // pre-allocate the compute buffer for the worst case (optional)
         ggml_gallocr_reserve(allocr, gf);
@@ -813,6 +816,7 @@ int main(int argc, char ** argv) {
                 printf("Failed to predict\n");
                 return 1;
             }
+            save_logits(logits.data(), model.hparams.n_vocab);
 
             t_predict_us += ggml_time_us() - t_start_us;
         }

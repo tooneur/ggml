@@ -2,6 +2,10 @@
 #define MODULAR_ENGINE_DISTRIB_H
 
 #include <stdbool.h>
+#include <stdio.h>
+
+struct ggml_cgraph;
+struct ggml_tensor;
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,12 +52,52 @@ typedef struct {
     double objective;
 } dist_partition_result_t;
 
+typedef struct dist_topology_node_t {
+    const struct ggml_tensor *tensor;
+    int tensor_index;
+    int parent;
+    int first_child;
+    int next_sibling;
+    int depth;
+    double compute_cost;
+} dist_topology_node_t;
+
+typedef struct {
+    int n_nodes;
+    int max_depth;
+    dist_topology_node_t *nodes;
+    int *topo_order;
+} dist_topology_tree_t;
+
 // Returns true on success, false on invalid input.
 // Buffers in result must be preallocated by caller.
 bool dist_partition_graph_balanced_min_cut(
     const dist_graph_t *graph,
     const dist_partition_config_t *config,
     dist_partition_result_t *result);
+
+// Build a lightweight topology tree from a ggml computation graph.
+bool dist_build_topology_tree_from_cgraph(
+    const struct ggml_cgraph *graph,
+    dist_topology_tree_t *tree);
+
+// Release memory owned by a topology tree.
+void dist_free_topology_tree(dist_topology_tree_t *tree);
+
+// Print a human-readable view of the tree.
+void dist_print_topology_tree(const dist_topology_tree_t *tree, FILE *stream);
+
+// Partition the tree by levels, keeping parent/child dependencies local when possible.
+bool dist_partition_topology_tree_levels(
+    const dist_topology_tree_t *tree,
+    int n_partitions,
+    int *vertex_to_partition,
+    double *partition_loads);
+
+// Approximate communication cost induced by cutting parent/child links across partitions.
+double dist_topology_tree_cut_cost(
+    const dist_topology_tree_t *tree,
+    const int *vertex_to_partition);
 
 // Export partition to DOT format for visualization.
 // vertex_labels: optional array of strings (size n_vertices), can be NULL

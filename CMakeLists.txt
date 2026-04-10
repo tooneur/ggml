@@ -27,22 +27,25 @@ endif()
 
 set(GGML_VERSION "${GGML_VERSION_BASE}")
 
-add_executable(parser modular_engine/parser_main.c modular_engine/parser.c modular_engine/distrib.c)
+add_executable(parser modular_engine/parser_main.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
 target_link_libraries(parser PRIVATE ggml m)
 
 
 
-add_executable(test_perso modular_engine/test.c modular_engine/parser.c modular_engine/distrib.c)
+add_executable(test_perso modular_engine/test.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
 target_link_libraries(test_perso PRIVATE ggml m)
 
-add_executable(visualizer modular_engine/visualizer.c modular_engine/parser.c modular_engine/distrib.c)
+add_executable(visualizer modular_engine/visualizer.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
 target_link_libraries(visualizer PRIVATE ggml m)
 
-add_executable(model_compare modular_engine/model_compare.c modular_engine/parser.c modular_engine/distrib.c)
+add_executable(model_compare modular_engine/model_compare.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
 target_link_libraries(model_compare PRIVATE ggml m)
 
-add_executable(model_diff modular_engine/model_diff.c modular_engine/parser.c modular_engine/distrib.c)
+add_executable(model_diff modular_engine/model_diff.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
 target_link_libraries(model_diff PRIVATE ggml m)
+
+add_executable(test_perf modular_engine/test_perf.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+target_link_libraries(test_perf PRIVATE ggml m)
 
 if(NOT GGML_BUILD_COMMIT)
     set(GGML_BUILD_COMMIT "unknown")

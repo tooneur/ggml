@@ -56,8 +56,6 @@ static int cmp_vertex_desc_cost_portable(const void *a, const void *b) {
 	return ia - ib;
 }
 
-static sort_ctx_t sort_context;
-
 static bool validate_inputs(
 	const dist_graph_t *graph,
 	const dist_partition_config_t *cfg,

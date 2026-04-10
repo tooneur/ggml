@@ -1491,23 +1491,62 @@ static void maybe_partition_runtime_graph(
         .objective = 0.0,
     };
 
-    if (!dist_partition_graph_balanced_min_cut(&graph, &cfg, &result))
+    bool partition_ok = false;
+    const int use_topology_tree = env_get_int_or_default("GGML_DISTRIB_TOPOLOGY_TREE", 0);
+    if (use_topology_tree != 0)
     {
-        printf("[distrib] Partitioning failed\n");
-        free(nodes);
-        free(vertex_cost);
-        free(part_of);
-        free(loads);
-        free(hot);
-        free(targets);
-        free(edges);
-        return;
+        dist_topology_tree_t tree = {0};
+        if (dist_build_topology_tree_from_cgraph(gf, &tree))
+        {
+            if (dist_partition_topology_tree_levels(&tree, n_partitions, result.vertex_to_partition, result.partition_loads))
+            {
+                result.cut_cost = dist_topology_tree_cut_cost(&tree, result.vertex_to_partition);
+
+                double tree_balance_penalty = 0.0;
+                for (int p = 0; p < n_partitions; ++p)
+                {
+                    tree_balance_penalty += load_penalty_single(result.partition_loads[p], targets[p]);
+                }
+
+                result.balance_penalty = tree_balance_penalty;
+                result.objective = cfg.lambda_comm * result.cut_cost + cfg.lambda_balance * result.balance_penalty;
+                partition_ok = true;
+
+                if (env_get_int_or_default("GGML_DISTRIB_VERBOSE", 0) != 0)
+                {
+                    dist_print_topology_tree(&tree, stdout);
+                }
+            }
+
+            dist_free_topology_tree(&tree);
+        }
+
+        if (!partition_ok)
+        {
+            printf("[distrib] topology tree partitioning failed, falling back to min-cut\n");
+        }
     }
 
-    const int colocate_kv = env_get_int_or_default("GGML_DISTRIB_COLOCATE_KV", 1);
-    if (colocate_kv != 0)
+    if (!partition_ok)
     {
-        apply_attention_kv_colocation_pass(&graph, &cfg, hot, targets, result.vertex_to_partition, result.partition_loads);
+        if (!dist_partition_graph_balanced_min_cut(&graph, &cfg, &result))
+        {
+            printf("[distrib] Partitioning failed\n");
+            free(nodes);
+            free(vertex_cost);
+            free(part_of);
+            free(loads);
+            free(hot);
+            free(targets);
+            free(edges);
+            return;
+        }
+
+        const int colocate_kv = env_get_int_or_default("GGML_DISTRIB_COLOCATE_KV", 1);
+        if (colocate_kv != 0)
+        {
+            apply_attention_kv_colocation_pass(&graph, &cfg, hot, targets, result.vertex_to_partition, result.partition_loads);
+        }
     }
 
     const double cut_after_colocation = compute_cross_partition_comm_bytes(&graph, result.vertex_to_partition);

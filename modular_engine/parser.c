@@ -1299,6 +1299,13 @@ static double compute_cross_partition_comm_bytes(const dist_graph_t *graph, cons
     return total;
 }
 
+static double load_penalty_single(double load, double target)
+{
+    const double denom = target > 1e-12 ? target : 1.0;
+    const double x = (load - target) / denom;
+    return x * x;
+}
+
 static void apply_attention_kv_colocation_pass(
     const dist_graph_t *graph,
     const dist_partition_config_t *cfg,
@@ -1367,7 +1374,7 @@ static void maybe_partition_runtime_graph(
         return;
     }
 
-    const int n_nodes = ggml_graph_size(gf);
+    const int n_nodes = ggml_graph_n_nodes(gf);
     if (n_nodes <= 0)
     {
         return;
@@ -1594,9 +1601,10 @@ static void maybe_partition_runtime_graph(
                 vertex_labels[i] = ggml_op_name(nodes[i]->op);
             }
 
-            const char *partition_names[] = {"Part"};
+            // Pass NULL to use built-in default names for all partitions.
+            // A single-entry array would be out-of-bounds when n_partitions > 1.
             dist_export_partition_to_dot("partition-plan.dot", &graph, &cfg, &result,
-                                        vertex_labels, partition_names);
+                                        vertex_labels, NULL);
             printf("[distrib] DOT graph exported to partition-plan.dot\n");
 
             free(vertex_labels);

@@ -60,7 +60,7 @@ bool dist_build_topology_tree_from_cgraph(const struct ggml_cgraph *graph, dist_
 
 	memset(tree, 0, sizeof(*tree));
 
-	const int n_nodes = ggml_graph_size((struct ggml_cgraph *) graph);
+	const int n_nodes = ggml_graph_n_nodes((struct ggml_cgraph *) graph);
 	if (n_nodes <= 0) {
 		return false;
 	}

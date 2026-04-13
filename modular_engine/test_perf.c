@@ -24,6 +24,9 @@ typedef struct {
 	double tokens_per_sec;
 	double comm_bytes_avg;
 	double comm_bytes_max;
+	double comm_bytes_total;
+	double comm_bytes_per_token;
+	double comm_estimated_net_s;
 	int comm_cut_edges_avg;
 	int runs;
 } bench_result_t;
@@ -100,6 +103,21 @@ static double monotonic_seconds(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static double env_get_double_or_default(const char *name, double default_value) {
+	const char *v = getenv(name);
+	if (v == NULL || *v == '\0') {
+		return default_value;
+	}
+
+	char *end = NULL;
+	double parsed = strtod(v, &end);
+	if (end == v || *end != '\0' || parsed <= 0.0) {
+		return default_value;
+	}
+
+	return parsed;
 }
 
 static void configure_mode_env(const bench_mode_t *mode) {
@@ -206,17 +224,26 @@ static bool run_mode_benchmark(
 	if (mode->n_nodes > 1) {
 		result->comm_bytes_avg = sum_comm_bytes / (double)n_iters;
 		result->comm_bytes_max = max_comm_bytes;
+		result->comm_bytes_total = sum_comm_bytes;
+		result->comm_bytes_per_token = n_tokens > 0 ? (result->comm_bytes_avg / (double)n_tokens) : 0.0;
 		result->comm_cut_edges_avg = (int)((double)sum_cut_edges / (double)n_iters + 0.5);
+
+		const double bw_gbps = env_get_double_or_default("GGML_DISTRIB_ESTIMATED_BW_GBPS", 10.0);
+		const double bw_bytes_per_s = bw_gbps * 1e9;
+		result->comm_estimated_net_s = bw_bytes_per_s > 0.0 ? (result->comm_bytes_avg / bw_bytes_per_s) : 0.0;
 	} else {
 		result->comm_bytes_avg = 0.0;
 		result->comm_bytes_max = 0.0;
+		result->comm_bytes_total = 0.0;
+		result->comm_bytes_per_token = 0.0;
+		result->comm_estimated_net_s = 0.0;
 		result->comm_cut_edges_avg = 0;
 	}
 
 	return true;
 }
 
-static void print_result_row(const bench_mode_t *mode, const bench_result_t *r) {
+static void print_result_row(const bench_mode_t *mode, const bench_result_t *r, int n_tokens) {
 	printf("%-16s | nodes=%d tree=%d | avg=%.4fs min=%.4fs max=%.4fs | tok/s=%.1f | comm_avg=%.0fB comm_max=%.0fB cut_edges~%d\n",
 		   mode->name,
 		   mode->n_nodes,
@@ -228,6 +255,22 @@ static void print_result_row(const bench_mode_t *mode, const bench_result_t *r) 
 		   r->comm_bytes_avg,
 		   r->comm_bytes_max,
 		   r->comm_cut_edges_avg);
+
+	if (mode->n_nodes > 1) {
+		const double avg_mb = r->comm_bytes_avg / (1024.0 * 1024.0);
+		const double total_mb = r->comm_bytes_total / (1024.0 * 1024.0);
+		const double per_token_kb = r->comm_bytes_per_token / 1024.0;
+		const int transfer_pct = r->time_avg_s > 0.0 ? (int)(100.0 * r->comm_estimated_net_s / r->time_avg_s + 0.5) : 0;
+
+		printf("  share_estimate: avg=%.2f MB/run, total=%.2f MB, %.2f KB/token (n_tokens=%d)\n",
+			   avg_mb,
+			   total_mb,
+			   per_token_kb,
+			   n_tokens);
+		printf("  net_lower_bound: %.3f ms/run at GGML_DISTRIB_ESTIMATED_BW_GBPS (default 10), ~%d%% of avg runtime\n",
+			   r->comm_estimated_net_s * 1000.0,
+			   transfer_pct);
+	}
 }
 
 int main(int argc, char **argv) {
@@ -300,7 +343,7 @@ int main(int argc, char **argv) {
 			free(model.model_name);
 			return 1;
 		}
-		print_result_row(&modes[i], &results[i]);
+		print_result_row(&modes[i], &results[i], n_tokens);
 	}
 
 	const double base = results[0].time_avg_s;
@@ -311,6 +354,7 @@ int main(int argc, char **argv) {
 	}
 
 	printf("Note: comm bytes are estimated from inter-partition edges in partition-plan.dot.\n");
+	printf("Note: set GGML_DISTRIB_ESTIMATED_BW_GBPS to model network bandwidth (example: 25 for 25 GB/s).\n");
 
 	free(tokens);
 	gguf_free(model.ctxgguf);

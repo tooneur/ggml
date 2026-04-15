@@ -6,7 +6,7 @@ add_executable(${TEST_TARGET} main-ctx.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml common common-ggml)
 
 set(TEST_TARGET gpt-2-alloc)
-add_executable(${TEST_TARGET} main-alloc.cpp ../../modular_engine/parser.c ../../modular_engine/distrib.c)
+add_executable(${TEST_TARGET} main-alloc.cpp ../../modular_engine/parser.c ../../modular_engine/distrib.c ../../modular_engine/dummy_distrib.c)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml common common-ggml m)
 target_include_directories(${TEST_TARGET} PRIVATE ../../modular_engine)
 

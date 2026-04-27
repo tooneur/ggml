@@ -76,6 +76,12 @@ bool dist_partition_graph_balanced_min_cut(
     const dist_partition_config_t *config,
     dist_partition_result_t *result);
 
+// Partition using KaHIP when available at build time.
+bool dist_partition_graph_kahip(
+    const dist_graph_t *graph,
+    const dist_partition_config_t *config,
+    dist_partition_result_t *result);
+
 // Build a lightweight topology tree from a ggml computation graph.
 bool dist_build_topology_tree_from_cgraph(
     const struct ggml_cgraph *graph,

@@ -27,25 +27,54 @@ endif()
 
 set(GGML_VERSION "${GGML_VERSION_BASE}")
 
-add_executable(parser modular_engine/parser_main.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+option(GGML_USE_KAHIP "Enable KaHIP backend for modular_engine partitioning" ON)
+set(KAHIP_ROOT "${CMAKE_SOURCE_DIR}/third_party/kahip-install" CACHE PATH "KaHIP installation prefix")
+if (GGML_USE_KAHIP)
+    find_path(KAHIP_INCLUDE_DIR NAMES kaHIP_interface.h HINTS "${KAHIP_ROOT}/include")
+    find_library(KAHIP_LIBRARY NAMES kahip HINTS "${KAHIP_ROOT}/lib" "${KAHIP_ROOT}/lib64")
+
+    if (KAHIP_INCLUDE_DIR AND KAHIP_LIBRARY)
+        set(GGML_HAVE_KAHIP ON)
+        message(STATUS "KaHIP found: ${KAHIP_LIBRARY}")
+    else()
+        set(GGML_HAVE_KAHIP OFF)
+        message(STATUS "KaHIP requested but not found. Set KAHIP_ROOT or disable with -DGGML_USE_KAHIP=OFF")
+    endif()
+else()
+    set(GGML_HAVE_KAHIP OFF)
+    message(STATUS "KaHIP backend disabled by GGML_USE_KAHIP=OFF")
+endif()
+
+set_source_files_properties(modular_engine/KaHIP.c PROPERTIES LANGUAGE CXX)
+
+add_executable(parser modular_engine/parser_main.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(parser PRIVATE ggml m)
 
 
 
-add_executable(test_perso modular_engine/test.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+add_executable(test_perso modular_engine/test.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(test_perso PRIVATE ggml m)
 
-add_executable(visualizer modular_engine/visualizer.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+add_executable(visualizer modular_engine/visualizer.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(visualizer PRIVATE ggml m)
 
-add_executable(model_compare modular_engine/model_compare.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+add_executable(model_compare modular_engine/model_compare.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(model_compare PRIVATE ggml m)
 
-add_executable(model_diff modular_engine/model_diff.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+add_executable(model_diff modular_engine/model_diff.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(model_diff PRIVATE ggml m)
 
-add_executable(test_perf modular_engine/test_perf.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c)
+add_executable(test_perf modular_engine/test_perf.c modular_engine/parser.c modular_engine/distrib.c modular_engine/dummy_distrib.c modular_engine/KaHIP.c)
 target_link_libraries(test_perf PRIVATE ggml m)
+
+if (GGML_HAVE_KAHIP)
+    set(MODULAR_ENGINE_TARGETS parser test_perso visualizer model_compare model_diff test_perf)
+    foreach(_tgt IN LISTS MODULAR_ENGINE_TARGETS)
+        target_include_directories(${_tgt} PRIVATE ${KAHIP_INCLUDE_DIR})
+        target_link_libraries(${_tgt} PRIVATE ${KAHIP_LIBRARY})
+        target_compile_definitions(${_tgt} PRIVATE GGML_USE_KAHIP=1)
+    endforeach()
+endif()
 
 if(NOT GGML_BUILD_COMMIT)
     set(GGML_BUILD_COMMIT "unknown")

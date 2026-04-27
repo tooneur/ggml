@@ -11,10 +11,13 @@
 #include "gguf.h"
 #include "parser.h"
 
+#define BENCH_MAX_PARTITIONS 64
+
 typedef struct {
 	const char *name;
 	int n_nodes;
 	int use_topology_tree;
+	int use_kahip;
 } bench_mode_t;
 
 typedef struct {
@@ -27,9 +30,17 @@ typedef struct {
 	double comm_bytes_total;
 	double comm_bytes_per_token;
 	double comm_estimated_net_s;
+	int n_partitions_observed;
+	double pair_bytes_avg[BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS];
 	int comm_cut_edges_avg;
 	int runs;
 } bench_result_t;
+
+typedef struct {
+	int from;
+	int to;
+	double bytes;
+} pair_route_t;
 
 static int parse_non_negative_int(const char *s, int *out) {
 	if (s == NULL || *s == '\0') {
@@ -126,11 +137,42 @@ static void configure_mode_env(const bench_mode_t *mode) {
 
 	setenv("GGML_DISTRIB_NODES", nodes_buf, 1);
 	setenv("GGML_DISTRIB_TOPOLOGY_TREE", mode->use_topology_tree ? "1" : "0", 1);
+	setenv("GGML_DISTRIB_USE_KAHIP", mode->use_kahip ? "1" : "0", 1);
 	setenv("GGML_DISTRIB_DOT_EXPORT", mode->n_nodes > 1 ? "1" : "0", 1);
 	setenv("GGML_DISTRIB_VERBOSE", "0", 1);
 }
 
-static bool parse_partition_dot_metrics(const char *dot_path, double *out_bytes, int *out_cut_edges) {
+static bool ensure_vertex_capacity(int **vertex_part, int *capacity, int vertex_id) {
+	if (vertex_id < *capacity) {
+		return true;
+	}
+
+	int new_capacity = *capacity;
+	while (new_capacity <= vertex_id) {
+		new_capacity *= 2;
+	}
+
+	int *grown = (int *)realloc(*vertex_part, (size_t)new_capacity * sizeof(int));
+	if (grown == NULL) {
+		return false;
+	}
+
+	for (int i = *capacity; i < new_capacity; ++i) {
+		grown[i] = -1;
+	}
+
+	*vertex_part = grown;
+	*capacity = new_capacity;
+	return true;
+}
+
+static bool parse_partition_dot_metrics(
+	const char *dot_path,
+	double *out_bytes,
+	int *out_cut_edges,
+	int max_partitions,
+	double *out_pair_matrix,
+	int *out_n_partitions) {
 	FILE *f = fopen(dot_path, "r");
 	if (f == NULL) {
 		return false;
@@ -138,10 +180,59 @@ static bool parse_partition_dot_metrics(const char *dot_path, double *out_bytes,
 
 	double total_bytes = 0.0;
 	int cut_edges = 0;
+	int n_partitions = 0;
 	char line[1024];
 
+	for (int i = 0; i < max_partitions * max_partitions; ++i) {
+		out_pair_matrix[i] = 0.0;
+	}
+
+	int vertex_capacity = 1024;
+	int *vertex_part = (int *)malloc((size_t)vertex_capacity * sizeof(int));
+	if (vertex_part == NULL) {
+		fclose(f);
+		return false;
+	}
+	for (int i = 0; i < vertex_capacity; ++i) {
+		vertex_part[i] = -1;
+	}
+
+	int current_partition = -1;
+
 	while (fgets(line, sizeof(line), f) != NULL) {
-		if (strstr(line, "style=\"bold\"") == NULL) {
+		int parsed_partition = -1;
+		if (sscanf(line, " subgraph cluster_p%d", &parsed_partition) == 1 || sscanf(line, "subgraph cluster_p%d", &parsed_partition) == 1) {
+			current_partition = parsed_partition;
+			if (parsed_partition + 1 > n_partitions) {
+				n_partitions = parsed_partition + 1;
+			}
+			continue;
+		}
+
+		if (current_partition >= 0) {
+			int v = -1;
+			if (sscanf(line, " v%d [", &v) == 1 || sscanf(line, "v%d [", &v) == 1) {
+				if (!ensure_vertex_capacity(&vertex_part, &vertex_capacity, v)) {
+					free(vertex_part);
+					fclose(f);
+					return false;
+				}
+				vertex_part[v] = current_partition;
+				continue;
+			}
+
+			if (strchr(line, '}') != NULL) {
+				current_partition = -1;
+			}
+		}
+
+		if (strstr(line, "->") == NULL) {
+			continue;
+		}
+
+		int src = -1;
+		int dst = -1;
+		if (sscanf(line, " v%d -> v%d", &src, &dst) != 2 && sscanf(line, "v%d -> v%d", &src, &dst) != 2) {
 			continue;
 		}
 
@@ -150,20 +241,35 @@ static bool parse_partition_dot_metrics(const char *dot_path, double *out_bytes,
 			continue;
 		}
 
-		label += 7;
 		char *endptr = NULL;
-		double w = strtod(label, &endptr);
-		if (endptr == label || w < 0.0) {
+		const char *label_num = label + 7;
+
+		double w = strtod(label_num, &endptr);
+		if (endptr == label_num || w < 0.0) {
 			continue;
 		}
+
+		if (src < 0 || dst < 0 || src >= vertex_capacity || dst >= vertex_capacity) {
+			continue;
+		}
+
+		const int src_p = vertex_part[src];
+		const int dst_p = vertex_part[dst];
+		if (src_p < 0 || dst_p < 0 || src_p >= max_partitions || dst_p >= max_partitions || src_p == dst_p) {
+			continue;
+		}
+
+		out_pair_matrix[src_p * max_partitions + dst_p] += w;
 
 		total_bytes += w;
 		cut_edges += 1;
 	}
 
+	free(vertex_part);
 	fclose(f);
 	*out_bytes = total_bytes;
 	*out_cut_edges = cut_edges;
+	*out_n_partitions = n_partitions > max_partitions ? max_partitions : n_partitions;
 	return true;
 }
 
@@ -178,11 +284,17 @@ static bool run_mode_benchmark(
 	double sum_time = 0.0;
 	double sum_comm_bytes = 0.0;
 	double max_comm_bytes = 0.0;
+	double sum_pair_matrix[BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS] = {0};
 	int sum_cut_edges = 0;
+    int max_observed_partitions = 0;
 
 	result->time_min_s = DBL_MAX;
 	result->time_max_s = 0.0;
+	result->n_partitions_observed = 0;
 	result->runs = 0;
+	for (int i = 0; i < BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS; ++i) {
+		result->pair_bytes_avg[i] = 0.0;
+	}
 
 	for (int i = 0; i < n_iters; ++i) {
 		configure_mode_env(mode);
@@ -206,9 +318,17 @@ static bool run_mode_benchmark(
 		if (mode->n_nodes > 1) {
 			double comm_bytes = 0.0;
 			int cut_edges = 0;
-			if (parse_partition_dot_metrics("partition-plan.dot", &comm_bytes, &cut_edges)) {
+			int n_parts = 0;
+			double pair_matrix[BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS] = {0};
+			if (parse_partition_dot_metrics("partition-plan.dot", &comm_bytes, &cut_edges, BENCH_MAX_PARTITIONS, pair_matrix, &n_parts)) {
 				sum_comm_bytes += comm_bytes;
 				sum_cut_edges += cut_edges;
+				if (n_parts > max_observed_partitions) {
+					max_observed_partitions = n_parts;
+				}
+				for (int k = 0; k < BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS; ++k) {
+					sum_pair_matrix[k] += pair_matrix[k];
+				}
 				if (comm_bytes > max_comm_bytes) {
 					max_comm_bytes = comm_bytes;
 				}
@@ -226,7 +346,11 @@ static bool run_mode_benchmark(
 		result->comm_bytes_max = max_comm_bytes;
 		result->comm_bytes_total = sum_comm_bytes;
 		result->comm_bytes_per_token = n_tokens > 0 ? (result->comm_bytes_avg / (double)n_tokens) : 0.0;
+		result->n_partitions_observed = max_observed_partitions;
 		result->comm_cut_edges_avg = (int)((double)sum_cut_edges / (double)n_iters + 0.5);
+		for (int k = 0; k < BENCH_MAX_PARTITIONS * BENCH_MAX_PARTITIONS; ++k) {
+			result->pair_bytes_avg[k] = sum_pair_matrix[k] / (double)n_iters;
+		}
 
 		const double bw_gbps = env_get_double_or_default("GGML_DISTRIB_ESTIMATED_BW_GBPS", 10.0);
 		const double bw_bytes_per_s = bw_gbps * 1e9;
@@ -237,10 +361,43 @@ static bool run_mode_benchmark(
 		result->comm_bytes_total = 0.0;
 		result->comm_bytes_per_token = 0.0;
 		result->comm_estimated_net_s = 0.0;
+		result->n_partitions_observed = 0;
 		result->comm_cut_edges_avg = 0;
 	}
 
 	return true;
+}
+
+static void print_top_pair_routes(const bench_result_t *r) {
+	pair_route_t top[5] = {0};
+	for (int p = 0; p < r->n_partitions_observed; ++p) {
+		for (int q = 0; q < r->n_partitions_observed; ++q) {
+			const double b = r->pair_bytes_avg[p * BENCH_MAX_PARTITIONS + q];
+			if (p == q || b <= 0.0) {
+				continue;
+			}
+
+			for (int i = 0; i < 5; ++i) {
+				if (b > top[i].bytes) {
+					for (int j = 4; j > i; --j) {
+						top[j] = top[j - 1];
+					}
+					top[i].from = p;
+					top[i].to = q;
+					top[i].bytes = b;
+					break;
+				}
+			}
+		}
+	}
+
+	printf("  top_inter_node_routes:\n");
+	for (int i = 0; i < 5; ++i) {
+		if (top[i].bytes <= 0.0) {
+			continue;
+		}
+		printf("    P%d -> P%d : %.2f MB/run\n", top[i].from, top[i].to, top[i].bytes / (1024.0 * 1024.0));
+	}
 }
 
 static void print_result_row(const bench_mode_t *mode, const bench_result_t *r, int n_tokens) {
@@ -270,6 +427,9 @@ static void print_result_row(const bench_mode_t *mode, const bench_result_t *r, 
 		printf("  net_lower_bound: %.3f ms/run at GGML_DISTRIB_ESTIMATED_BW_GBPS (default 10), ~%d%% of avg runtime\n",
 			   r->comm_estimated_net_s * 1000.0,
 			   transfer_pct);
+		if (r->n_partitions_observed > 1) {
+			print_top_pair_routes(r);
+		}
 	}
 }
 
@@ -315,11 +475,17 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	bench_mode_t modes[3] = {
-		{.name = "baseline", .n_nodes = 1, .use_topology_tree = 0},
-		{.name = "mincut", .n_nodes = n_nodes, .use_topology_tree = 0},
-		{.name = "topology-tree", .n_nodes = n_nodes, .use_topology_tree = 1},
+	bench_mode_t modes[4] = {
+		{.name = "baseline", .n_nodes = 1, .use_topology_tree = 0, .use_kahip = 0},
+		{.name = "mincut", .n_nodes = n_nodes, .use_topology_tree = 0, .use_kahip = 0},
+		{.name = "topology-tree", .n_nodes = n_nodes, .use_topology_tree = 1, .use_kahip = 0},
+		{.name = "kahip", .n_nodes = n_nodes, .use_topology_tree = 0, .use_kahip = 1},
 	};
+
+	int mode_count = 3;
+#ifdef GGML_USE_KAHIP
+	mode_count = 4;
+#endif
 
 	printf("Benchmark config: n_tokens=%d n_past=%d iterations=%d n_nodes=%d\n", n_tokens, n_past, n_iters, n_nodes);
 	printf("Warmup run (baseline) ...\n");
@@ -334,8 +500,8 @@ int main(int argc, char **argv) {
 	}
 
 	printf("\n=== Performance Summary ===\n");
-	bench_result_t results[3] = {0};
-	for (int i = 0; i < 3; ++i) {
+	bench_result_t results[4] = {0};
+	for (int i = 0; i < mode_count; ++i) {
 		if (!run_mode_benchmark(&model, tokens, n_tokens, n_past, n_iters, &modes[i], &results[i])) {
 			printf("Benchmark failed for mode: %s\n", modes[i].name);
 			free(tokens);
@@ -351,10 +517,17 @@ int main(int argc, char **argv) {
 		const double mincut_speedup = base / results[1].time_avg_s;
 		const double topo_speedup = base / results[2].time_avg_s;
 		printf("\nRelative speedup vs baseline: mincut=%.3fx topology-tree=%.3fx\n", mincut_speedup, topo_speedup);
+		if (mode_count > 3) {
+			const double kahip_speedup = base / results[3].time_avg_s;
+			printf("Relative speedup vs baseline: kahip=%.3fx\n", kahip_speedup);
+		}
 	}
 
 	printf("Note: comm bytes are estimated from inter-partition edges in partition-plan.dot.\n");
 	printf("Note: set GGML_DISTRIB_ESTIMATED_BW_GBPS to model network bandwidth (example: 25 for 25 GB/s).\n");
+#ifndef GGML_USE_KAHIP
+	printf("Note: KaHIP mode not compiled in this binary (configure with KaHIP to enable it).\n");
+#endif
 
 	free(tokens);
 	gguf_free(model.ctxgguf);

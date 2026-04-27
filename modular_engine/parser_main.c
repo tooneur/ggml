@@ -99,8 +99,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Default behavior: a single token id runs as a batch of 32 identical tokens
-    // to match the reference graph shapes. CSV input keeps its explicit batch size.
     if (n_tokens == 1 && strchr(token_arg, ',') == NULL) {
         int target_n_tokens = 32;
 

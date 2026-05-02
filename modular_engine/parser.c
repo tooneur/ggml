@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 #include "ggml.h"
 #include "gguf.h"
@@ -79,8 +80,6 @@ static struct ggml_tensor *mul_mat(
                (long long)x->ne[2], (long long)x->ne[3]);
         return NULL;
     }
-
-    // Tout est OK → juste multiplier
     return ggml_mul_mat(ctx, w, x);
 }
 
@@ -380,6 +379,8 @@ struct inference_layer_tensors
 
     struct ggml_tensor *c_fc_w;
     struct ggml_tensor *c_fc_b;
+    struct ggml_tensor *c_fc_gate_w;
+    struct ggml_tensor *c_fc_gate_b;
     struct ggml_tensor *c_proj2_w;
     struct ggml_tensor *c_proj2_b;
 };
@@ -429,9 +430,13 @@ struct inference_profile
     struct inference_pattern_list ln_2_b;
     struct inference_pattern_list c_fc_w;
     struct inference_pattern_list c_fc_b;
+    struct inference_pattern_list c_fc_gate_w;
+    struct inference_pattern_list c_fc_gate_b;
     struct inference_pattern_list c_proj2_w;
     struct inference_pattern_list c_proj2_b;
 };
+
+#define INFER_MAX_PATTERNS 12
 
 static const char *NAMES_WTE[] = {
     "token_embd.weight",
@@ -450,6 +455,7 @@ static const char *NAMES_LN_F_G[] = {
     "output_norm.weight",
     "transformer.ln_f.weight",
     "model.decoder.final_layer_norm.weight",
+    "model.output_norm.weight",
     "model.norm.weight",
     "norm.weight",
 };
@@ -465,12 +471,15 @@ static const char *NAMES_LN_F_B[] = {
 static const char *NAMES_LM_HEAD[] = {
     "output.weight",
     "lm_head.weight",
+    "model.lm_head.weight",
     "model.decoder.output_projection.weight",
 };
 
 static const char *PATS_LN_1_G[] = {
     "blk.%d.attn_norm.weight",
     "transformer.h.%d.ln_1.weight",
+    "model.layers.%d.input_layernorm.weight",
+    "layers.%d.attention_norm.weight",
     "model.decoder.layers.%d.self_attn_layer_norm.weight",
 };
 
@@ -492,31 +501,51 @@ static const char *PATS_C_ATTN_B[] = {
 };
 
 static const char *PATS_Q_ATTN_W[] = {
+    "blk.%d.attn_q.weight",
+    "model.layers.%d.self_attn.q_proj.weight",
+    "layers.%d.attention.wq.weight",
     "model.decoder.layers.%d.self_attn.q_proj.weight",
 };
 
 static const char *PATS_Q_ATTN_B[] = {
+    "blk.%d.attn_q.bias",
+    "model.layers.%d.self_attn.q_proj.bias",
+    "layers.%d.attention.wq.bias",
     "model.decoder.layers.%d.self_attn.q_proj.bias",
 };
 
 static const char *PATS_K_ATTN_W[] = {
+    "blk.%d.attn_k.weight",
+    "model.layers.%d.self_attn.k_proj.weight",
+    "layers.%d.attention.wk.weight",
     "model.decoder.layers.%d.self_attn.k_proj.weight",
 };
 
 static const char *PATS_K_ATTN_B[] = {
+    "blk.%d.attn_k.bias",
+    "model.layers.%d.self_attn.k_proj.bias",
+    "layers.%d.attention.wk.bias",
     "model.decoder.layers.%d.self_attn.k_proj.bias",
 };
 
 static const char *PATS_V_ATTN_W[] = {
+    "blk.%d.attn_v.weight",
+    "model.layers.%d.self_attn.v_proj.weight",
+    "layers.%d.attention.wv.weight",
     "model.decoder.layers.%d.self_attn.v_proj.weight",
 };
 
 static const char *PATS_V_ATTN_B[] = {
+    "blk.%d.attn_v.bias",
+    "model.layers.%d.self_attn.v_proj.bias",
+    "layers.%d.attention.wv.bias",
     "model.decoder.layers.%d.self_attn.v_proj.bias",
 };
 
 static const char *PATS_C_PROJ_W[] = {
     "blk.%d.attn_output.weight",
+    "model.layers.%d.self_attn.o_proj.weight",
+    "layers.%d.attention.wo.weight",
     "transformer.h.%d.attn.c_proj.weight",
     "model.decoder.layers.%d.self_attn.out_proj.weight",
 };
@@ -531,6 +560,7 @@ static const char *PATS_C_PROJ_B[] = {
 static const char *PATS_LN_2_G[] = {
     "blk.%d.ffn_norm.weight",
     "transformer.h.%d.ln_2.weight",
+    "model.layers.%d.post_attention_layernorm.weight",
     "model.decoder.layers.%d.final_layer_norm.weight",
 };
 
@@ -543,6 +573,8 @@ static const char *PATS_LN_2_B[] = {
 
 static const char *PATS_C_FC_W[] = {
     "blk.%d.ffn_up.weight",
+    "model.layers.%d.mlp.up_proj.weight",
+    "layers.%d.feed_forward.w3.weight",
     "transformer.h.%d.mlp.c_fc.weight",
     "model.decoder.layers.%d.fc1.weight",
 };
@@ -554,8 +586,23 @@ static const char *PATS_C_FC_B[] = {
     "model.decoder.layers.%d.fc1.bias",
 };
 
+static const char *PATS_C_FC_GATE_W[] = {
+    "blk.%d.ffn_gate.weight",
+    "model.layers.%d.mlp.gate_proj.weight",
+    "layers.%d.feed_forward.w1.weight",
+    "model.decoder.layers.%d.fc1_gate.weight",
+};
+
+static const char *PATS_C_FC_GATE_B[] = {
+    "blk.%d.ffn_gate.bias",
+    "model.layers.%d.mlp.gate_proj.bias",
+    "model.decoder.layers.%d.fc1_gate.bias",
+};
+
 static const char *PATS_C_PROJ2_W[] = {
     "blk.%d.ffn_down.weight",
+    "model.layers.%d.mlp.down_proj.weight",
+    "layers.%d.feed_forward.w2.weight",
     "transformer.h.%d.mlp.c_proj.weight",
     "model.decoder.layers.%d.fc2.weight",
 };
@@ -573,11 +620,11 @@ static const struct inference_profile PROFILE_DECODER_QKV_FUSED = {
 
     .wte = {.names = NAMES_WTE, .n_names = 4, .label = "wte", .required = true},
     .wpe = {.names = NAMES_WPE, .n_names = 3, .label = "wpe", .required = false},
-    .ln_f_g = {.names = NAMES_LN_F_G, .n_names = 5, .label = "ln_f.weight", .required = true},
+    .ln_f_g = {.names = NAMES_LN_F_G, .n_names = 6, .label = "ln_f.weight", .required = true},
     .ln_f_b = {.names = NAMES_LN_F_B, .n_names = 5, .label = "ln_f.bias", .required = false},
-    .lm_head = {.names = NAMES_LM_HEAD, .n_names = 3, .label = "lm_head", .required = true},
+    .lm_head = {.names = NAMES_LM_HEAD, .n_names = 4, .label = "lm_head", .required = true},
 
-    .ln_1_g = {.patterns = PATS_LN_1_G, .n_patterns = 3, .label = "layer.ln_1_g", .required = true},
+    .ln_1_g = {.patterns = PATS_LN_1_G, .n_patterns = 5, .label = "layer.ln_1_g", .required = true},
     .ln_1_b = {.patterns = PATS_LN_1_B, .n_patterns = 3, .label = "layer.ln_1_b", .required = false},
     .c_attn_w = {.patterns = PATS_C_ATTN_W, .n_patterns = 2, .label = "layer.c_attn_w", .required = true},
     .c_attn_b = {.patterns = PATS_C_ATTN_B, .n_patterns = 3, .label = "layer.c_attn_b", .required = false},
@@ -587,13 +634,15 @@ static const struct inference_profile PROFILE_DECODER_QKV_FUSED = {
     .k_attn_b = {.patterns = NULL, .n_patterns = 0, .label = "layer.k_attn_b", .required = false},
     .v_attn_w = {.patterns = NULL, .n_patterns = 0, .label = "layer.v_attn_w", .required = false},
     .v_attn_b = {.patterns = NULL, .n_patterns = 0, .label = "layer.v_attn_b", .required = false},
-    .c_proj_w = {.patterns = PATS_C_PROJ_W, .n_patterns = 3, .label = "layer.c_proj_w", .required = true},
+    .c_proj_w = {.patterns = PATS_C_PROJ_W, .n_patterns = 5, .label = "layer.c_proj_w", .required = true},
     .c_proj_b = {.patterns = PATS_C_PROJ_B, .n_patterns = 4, .label = "layer.c_proj_b", .required = false},
-    .ln_2_g = {.patterns = PATS_LN_2_G, .n_patterns = 3, .label = "layer.ln_2_g", .required = true},
+    .ln_2_g = {.patterns = PATS_LN_2_G, .n_patterns = 4, .label = "layer.ln_2_g", .required = true},
     .ln_2_b = {.patterns = PATS_LN_2_B, .n_patterns = 4, .label = "layer.ln_2_b", .required = false},
-    .c_fc_w = {.patterns = PATS_C_FC_W, .n_patterns = 3, .label = "layer.c_fc_w", .required = true},
+    .c_fc_w = {.patterns = PATS_C_FC_W, .n_patterns = 5, .label = "layer.c_fc_w", .required = true},
     .c_fc_b = {.patterns = PATS_C_FC_B, .n_patterns = 4, .label = "layer.c_fc_b", .required = false},
-    .c_proj2_w = {.patterns = PATS_C_PROJ2_W, .n_patterns = 3, .label = "layer.c_proj2_w", .required = true},
+    .c_fc_gate_w = {.patterns = NULL, .n_patterns = 0, .label = "layer.c_fc_gate_w", .required = false},
+    .c_fc_gate_b = {.patterns = NULL, .n_patterns = 0, .label = "layer.c_fc_gate_b", .required = false},
+    .c_proj2_w = {.patterns = PATS_C_PROJ2_W, .n_patterns = 5, .label = "layer.c_proj2_w", .required = true},
     .c_proj2_b = {.patterns = PATS_C_PROJ2_B, .n_patterns = 4, .label = "layer.c_proj2_b", .required = false},
 };
 
@@ -603,27 +652,29 @@ static const struct inference_profile PROFILE_DECODER_QKV_SPLIT = {
 
     .wte = {.names = NAMES_WTE, .n_names = 4, .label = "wte", .required = true},
     .wpe = {.names = NAMES_WPE, .n_names = 3, .label = "wpe", .required = false},
-    .ln_f_g = {.names = NAMES_LN_F_G, .n_names = 5, .label = "ln_f.weight", .required = true},
+    .ln_f_g = {.names = NAMES_LN_F_G, .n_names = 6, .label = "ln_f.weight", .required = true},
     .ln_f_b = {.names = NAMES_LN_F_B, .n_names = 5, .label = "ln_f.bias", .required = false},
-    .lm_head = {.names = NAMES_LM_HEAD, .n_names = 3, .label = "lm_head", .required = true},
+    .lm_head = {.names = NAMES_LM_HEAD, .n_names = 4, .label = "lm_head", .required = true},
 
-    .ln_1_g = {.patterns = PATS_LN_1_G, .n_patterns = 3, .label = "layer.ln_1_g", .required = true},
+    .ln_1_g = {.patterns = PATS_LN_1_G, .n_patterns = 5, .label = "layer.ln_1_g", .required = true},
     .ln_1_b = {.patterns = PATS_LN_1_B, .n_patterns = 3, .label = "layer.ln_1_b", .required = false},
     .c_attn_w = {.patterns = NULL, .n_patterns = 0, .label = "layer.c_attn_w", .required = false},
     .c_attn_b = {.patterns = NULL, .n_patterns = 0, .label = "layer.c_attn_b", .required = false},
-    .q_attn_w = {.patterns = PATS_Q_ATTN_W, .n_patterns = 1, .label = "layer.q_attn_w", .required = true},
-    .q_attn_b = {.patterns = PATS_Q_ATTN_B, .n_patterns = 1, .label = "layer.q_attn_b", .required = false},
-    .k_attn_w = {.patterns = PATS_K_ATTN_W, .n_patterns = 1, .label = "layer.k_attn_w", .required = true},
-    .k_attn_b = {.patterns = PATS_K_ATTN_B, .n_patterns = 1, .label = "layer.k_attn_b", .required = false},
-    .v_attn_w = {.patterns = PATS_V_ATTN_W, .n_patterns = 1, .label = "layer.v_attn_w", .required = true},
-    .v_attn_b = {.patterns = PATS_V_ATTN_B, .n_patterns = 1, .label = "layer.v_attn_b", .required = false},
-    .c_proj_w = {.patterns = PATS_C_PROJ_W, .n_patterns = 3, .label = "layer.c_proj_w", .required = true},
+    .q_attn_w = {.patterns = PATS_Q_ATTN_W, .n_patterns = 4, .label = "layer.q_attn_w", .required = true},
+    .q_attn_b = {.patterns = PATS_Q_ATTN_B, .n_patterns = 4, .label = "layer.q_attn_b", .required = false},
+    .k_attn_w = {.patterns = PATS_K_ATTN_W, .n_patterns = 4, .label = "layer.k_attn_w", .required = true},
+    .k_attn_b = {.patterns = PATS_K_ATTN_B, .n_patterns = 4, .label = "layer.k_attn_b", .required = false},
+    .v_attn_w = {.patterns = PATS_V_ATTN_W, .n_patterns = 4, .label = "layer.v_attn_w", .required = true},
+    .v_attn_b = {.patterns = PATS_V_ATTN_B, .n_patterns = 4, .label = "layer.v_attn_b", .required = false},
+    .c_proj_w = {.patterns = PATS_C_PROJ_W, .n_patterns = 5, .label = "layer.c_proj_w", .required = true},
     .c_proj_b = {.patterns = PATS_C_PROJ_B, .n_patterns = 4, .label = "layer.c_proj_b", .required = false},
-    .ln_2_g = {.patterns = PATS_LN_2_G, .n_patterns = 3, .label = "layer.ln_2_g", .required = true},
+    .ln_2_g = {.patterns = PATS_LN_2_G, .n_patterns = 4, .label = "layer.ln_2_g", .required = true},
     .ln_2_b = {.patterns = PATS_LN_2_B, .n_patterns = 4, .label = "layer.ln_2_b", .required = false},
-    .c_fc_w = {.patterns = PATS_C_FC_W, .n_patterns = 3, .label = "layer.c_fc_w", .required = true},
+    .c_fc_w = {.patterns = PATS_C_FC_W, .n_patterns = 5, .label = "layer.c_fc_w", .required = true},
     .c_fc_b = {.patterns = PATS_C_FC_B, .n_patterns = 4, .label = "layer.c_fc_b", .required = false},
-    .c_proj2_w = {.patterns = PATS_C_PROJ2_W, .n_patterns = 3, .label = "layer.c_proj2_w", .required = true},
+    .c_fc_gate_w = {.patterns = PATS_C_FC_GATE_W, .n_patterns = 4, .label = "layer.c_fc_gate_w", .required = false},
+    .c_fc_gate_b = {.patterns = PATS_C_FC_GATE_B, .n_patterns = 3, .label = "layer.c_fc_gate_b", .required = false},
+    .c_proj2_w = {.patterns = PATS_C_PROJ2_W, .n_patterns = 5, .label = "layer.c_proj2_w", .required = true},
     .c_proj2_b = {.patterns = PATS_C_PROJ2_B, .n_patterns = 4, .label = "layer.c_proj2_b", .required = false},
 };
 
@@ -644,8 +695,8 @@ static bool profile_has_required_tensors(const struct model *model, const struct
         return false;
     }
 
-    char names_buf[6][128];
-    const char *names[6];
+    char names_buf[INFER_MAX_PATTERNS][128];
+    const char *names[INFER_MAX_PATTERNS];
 
     const struct inference_pattern_list *attn_req[3] = {0};
     int attn_req_count = 0;
@@ -664,7 +715,7 @@ static bool profile_has_required_tensors(const struct model *model, const struct
     for (int req = 0; req < attn_req_count; ++req)
     {
         const struct inference_pattern_list *spec = attn_req[req];
-        if (spec->n_patterns <= 0 || spec->n_patterns > 6)
+        if (spec->n_patterns <= 0 || spec->n_patterns > INFER_MAX_PATTERNS)
         {
             return false;
         }
@@ -685,12 +736,55 @@ static bool profile_has_required_tensors(const struct model *model, const struct
     return true;
 }
 
+static bool name_contains_any_ci(const char *name, const char *const *needles, int n_needles)
+{
+    if (name == NULL)
+    {
+        return false;
+    }
+
+    char lower_name[256] = {0};
+    const size_t n = strlen(name);
+    const size_t cap = sizeof(lower_name) - 1;
+    const size_t m = n < cap ? n : cap;
+
+    for (size_t i = 0; i < m; ++i)
+    {
+        lower_name[i] = (char)tolower((unsigned char)name[i]);
+    }
+    lower_name[m] = '\0';
+
+    for (int i = 0; i < n_needles; ++i)
+    {
+        if (needles[i] != NULL && strstr(lower_name, needles[i]) != NULL)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static const struct inference_profile *get_inference_profile(const struct model *model)
 {
+    static const char *FUSED_HINTS[] = {"gpt2", "gpt-j", "opt", "mpt"};
+    static const char *SPLIT_HINTS[] = {"llama", "mistral", "mixtral", "qwen", "gemma", "phi", "falcon", "neox"};
+
     const struct inference_profile *candidates[] = {
         &PROFILE_DECODER_QKV_SPLIT,
         &PROFILE_DECODER_QKV_FUSED,
     };
+
+    if (name_contains_any_ci(model->model_name, FUSED_HINTS, 4))
+    {
+        candidates[0] = &PROFILE_DECODER_QKV_FUSED;
+        candidates[1] = &PROFILE_DECODER_QKV_SPLIT;
+    }
+    else if (name_contains_any_ci(model->model_name, SPLIT_HINTS, 8))
+    {
+        candidates[0] = &PROFILE_DECODER_QKV_SPLIT;
+        candidates[1] = &PROFILE_DECODER_QKV_FUSED;
+    }
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i)
     {
@@ -700,8 +794,7 @@ static const struct inference_profile *get_inference_profile(const struct model 
         }
     }
 
-    // Keep legacy fallback behavior to avoid regressions on partially named checkpoints.
-    return &PROFILE_DECODER_QKV_FUSED;
+    return NULL;
 }
 
 static bool load_tensor_from_name_list(
@@ -729,10 +822,10 @@ static bool load_block_tensor_from_patterns(
     struct ggml_tensor **out,
     const struct inference_pattern_list *spec)
 {
-    char names_buf[6][128];
-    const char *names[6];
+    char names_buf[INFER_MAX_PATTERNS][128];
+    const char *names[INFER_MAX_PATTERNS];
 
-    if (spec->n_patterns <= 0 || spec->n_patterns > 6)
+    if (spec->n_patterns <= 0 || spec->n_patterns > INFER_MAX_PATTERNS)
     {
         printf("Invalid pattern count for %s\n", spec->label);
         return false;
@@ -810,6 +903,8 @@ static bool load_inference_layer_tensors(
     t->k_attn_b = NULL;
     t->v_attn_w = NULL;
     t->v_attn_b = NULL;
+    t->c_fc_gate_w = NULL;
+    t->c_fc_gate_b = NULL;
 
     if (profile->qkv_fused)
     {
@@ -873,6 +968,20 @@ static bool load_inference_layer_tensors(
     {
         return false;
     }
+    if (profile->c_fc_gate_w.n_patterns > 0)
+    {
+        if (!load_block_tensor_from_patterns(model->ctx, layer_idx, &t->c_fc_gate_w, &profile->c_fc_gate_w))
+        {
+            return false;
+        }
+    }
+    if (profile->c_fc_gate_b.n_patterns > 0)
+    {
+        if (!load_block_tensor_from_patterns(model->ctx, layer_idx, &t->c_fc_gate_b, &profile->c_fc_gate_b))
+        {
+            return false;
+        }
+    }
     if (!load_block_tensor_from_patterns(model->ctx, layer_idx, &t->c_proj2_w, &profile->c_proj2_w))
     {
         return false;
@@ -918,6 +1027,50 @@ static struct ggml_tensor *add_bias_if_present(
     return ggml_add(ctx0, x, ggml_repeat(ctx0, bias, x));
 }
 
+static struct ggml_tensor *expand_kv_width_to_match_q(
+    struct ggml_context *ctx0,
+    struct ggml_tensor *kv,
+    int64_t q_width,
+    int64_t n_head,
+    int64_t seq_len,
+    const char *name)
+{
+    const int64_t kv_width = kv->ne[0];
+    if (kv_width == q_width)
+    {
+        return kv;
+    }
+
+    if (n_head <= 0 || (q_width % n_head) != 0)
+    {
+        printf("Invalid attention geometry for %s: q_width=%lld n_head=%lld\n",
+               name, (long long)q_width, (long long)n_head);
+        return NULL;
+    }
+
+    const int64_t head_dim = q_width / n_head;
+    if (head_dim <= 0 || (kv_width % head_dim) != 0)
+    {
+        printf("Cannot map %s width %lld to q_width %lld with head_dim %lld\n",
+               name, (long long)kv_width, (long long)q_width, (long long)head_dim);
+        return NULL;
+    }
+
+    const int64_t n_head_kv = kv_width / head_dim;
+    if (n_head_kv <= 0 || (n_head % n_head_kv) != 0)
+    {
+        printf("Unsupported GQA ratio for %s: n_head=%lld n_head_kv=%lld\n",
+               name, (long long)n_head, (long long)n_head_kv);
+        return NULL;
+    }
+
+    struct ggml_tensor *kv_3d = ggml_reshape_3d(ctx0, kv, head_dim, n_head_kv, seq_len);
+    struct ggml_tensor *target = ggml_new_tensor_3d(ctx0, kv->type, head_dim, n_head, seq_len);
+    struct ggml_tensor *kv_rep = ggml_repeat(ctx0, kv_3d, target);
+
+    return ggml_cont_2d(ctx0, kv_rep, q_width, seq_len);
+}
+
 static struct ggml_tensor *build_self_attention_single_token(
     struct ggml_context *ctx0,
     struct ggml_tensor *ln_1,
@@ -933,7 +1086,6 @@ static struct ggml_tensor *build_self_attention_single_token(
     struct ggml_tensor *memory_v,
     struct ggml_cgraph *gf)
 {
-    const int64_t head_dim = n_embd / n_head;
     struct ggml_tensor *Qcur = NULL;
     struct ggml_tensor *Kcur = NULL;
     struct ggml_tensor *Vcur = NULL;
@@ -967,6 +1119,27 @@ static struct ggml_tensor *build_self_attention_single_token(
         Vcur = add_bias_if_present(ctx0, Vcur, layer->v_attn_b);
     }
 
+    const int64_t q_width = Qcur->ne[0];
+    if (q_width <= 0)
+    {
+        printf("Invalid Q width: %lld\n", (long long)q_width);
+        return NULL;
+    }
+    if (n_head <= 0 || (q_width % n_head) != 0)
+    {
+        printf("Invalid Q geometry: q_width=%lld n_head=%lld\n", (long long)q_width, (long long)n_head);
+        return NULL;
+    }
+
+    const int64_t head_dim = q_width / n_head;
+
+    Kcur = expand_kv_width_to_match_q(ctx0, Kcur, q_width, n_head, N, "Kcur");
+    Vcur = expand_kv_width_to_match_q(ctx0, Vcur, q_width, n_head, N, "Vcur");
+    if (Kcur == NULL || Vcur == NULL)
+    {
+        return NULL;
+    }
+
     // Store current K/V into cache, matching the reference GPT-2 graph behavior.
     if (memory_k != NULL && memory_v != NULL && gf != NULL && N >= 1)
     {
@@ -977,12 +1150,12 @@ static struct ggml_tensor *build_self_attention_single_token(
         struct ggml_tensor *k_dst = ggml_view_1d(
             ctx0,
             memory_k,
-            N * n_embd,
+            N * q_width,
             k_stride * (layer_base + n_past));
         struct ggml_tensor *v_dst = ggml_view_1d(
             ctx0,
             memory_v,
-            N * n_embd,
+            N * q_width,
             v_stride * (layer_base + n_past));
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_dst));
@@ -1002,7 +1175,7 @@ static struct ggml_tensor *build_self_attention_single_token(
                          ggml_view_1d(
                              ctx0,
                              memory_k,
-                             ((int64_t)n_past + N) * n_embd,
+                             ((int64_t)n_past + N) * q_width,
                              (size_t)ggml_element_size(memory_k) * n_embd * ((int64_t)layer_idx * n_ctx)),
                          head_dim,
                          n_head,
@@ -1011,7 +1184,7 @@ static struct ggml_tensor *build_self_attention_single_token(
 
     // ggml reference GPT-2 path uses K * Q to produce [seq_k, seq_q, n_head].
     struct ggml_tensor *KQ = ggml_mul_mat(ctx0, K, Q);
-    struct ggml_tensor *KQ_scaled = ggml_scale(ctx0, KQ, 1.0f / sqrtf((float)n_embd / (float)n_head));
+    struct ggml_tensor *KQ_scaled = ggml_scale(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
     // Keep causal behavior explicit even in single-token mode.
     struct ggml_tensor *KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
     struct ggml_tensor *KQ_soft_max = ggml_soft_max(ctx0, KQ_masked);
@@ -1024,7 +1197,7 @@ static struct ggml_tensor *build_self_attention_single_token(
                                       ggml_view_1d(
                                           ctx0,
                                           memory_v,
-                                          ((int64_t)n_past + N) * n_embd,
+                                          ((int64_t)n_past + N) * q_width,
                                           (size_t)ggml_element_size(memory_v) * n_embd * ((int64_t)layer_idx * n_ctx)),
                                       head_dim,
                                       n_head,
@@ -1034,7 +1207,7 @@ static struct ggml_tensor *build_self_attention_single_token(
 
     struct ggml_tensor *KQV = ggml_mul_mat(ctx0, V_trans, KQ_soft_max);
     struct ggml_tensor *KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-    struct ggml_tensor *attn_ctx = ggml_cont_2d(ctx0, KQV_merged, n_embd, N);
+    struct ggml_tensor *attn_ctx = ggml_cont_2d(ctx0, KQV_merged, q_width, N);
 
     struct ggml_tensor *attn_out = mul_mat(ctx0, layer->c_proj_w, attn_ctx, "c_proj_w * attn_ctx");
     if (attn_out == NULL)
@@ -1049,13 +1222,29 @@ static struct ggml_tensor *build_ffn(
     struct ggml_tensor *ln_2,
     const struct inference_layer_tensors *layer)
 {
-    struct ggml_tensor *ff = mul_mat(ctx0, layer->c_fc_w, ln_2, "c_fc_w * ln_2");
-    if (ff == NULL)
+    struct ggml_tensor *up = mul_mat(ctx0, layer->c_fc_w, ln_2, "c_fc_w * ln_2");
+    if (up == NULL)
     {
         return NULL;
     }
-    ff = add_bias_if_present(ctx0, ff, layer->c_fc_b);
-    ff = ggml_gelu(ctx0, ff);
+    up = add_bias_if_present(ctx0, up, layer->c_fc_b);
+
+    struct ggml_tensor *ff = NULL;
+    if (layer->c_fc_gate_w != NULL)
+    {
+        struct ggml_tensor *gate = mul_mat(ctx0, layer->c_fc_gate_w, ln_2, "c_fc_gate_w * ln_2");
+        if (gate == NULL)
+        {
+            return NULL;
+        }
+        gate = add_bias_if_present(ctx0, gate, layer->c_fc_gate_b);
+        gate = ggml_silu(ctx0, gate);
+        ff = ggml_mul(ctx0, gate, up);
+    }
+    else
+    {
+        ff = ggml_gelu(ctx0, up);
+    }
 
     ff = mul_mat(ctx0, layer->c_proj2_w, ff, "c_proj2_w * ff");
     if (ff == NULL)
@@ -1096,7 +1285,10 @@ static struct ggml_tensor *run_transformer_block_single_token(
     struct ggml_tensor *memory_v,
     struct ggml_cgraph *gf)
 {
-    struct ggml_tensor *ln_1 = apply_layer_norm_affine(ctx0, x, layer->ln_1_g, layer->ln_1_b);
+    const bool use_rmsnorm = (layer->ln_1_b == NULL && layer->ln_2_b == NULL);
+    struct ggml_tensor *ln_1 = use_rmsnorm
+                                  ? apply_rmsnorm_affine(ctx0, x, layer->ln_1_g)
+                                  : apply_layer_norm_affine(ctx0, x, layer->ln_1_g, layer->ln_1_b);
     struct ggml_tensor *attn_out = build_self_attention_single_token(ctx0, ln_1, layer, profile, n_embd, n_head, n_ctx, n_past, N, layer_idx, memory_k, memory_v, gf);
     if (attn_out == NULL)
     {
@@ -1104,7 +1296,9 @@ static struct ggml_tensor *run_transformer_block_single_token(
     }
 
     struct ggml_tensor *x_attn = ggml_add(ctx0, x, attn_out);
-    struct ggml_tensor *ln_2 = apply_layer_norm_affine(ctx0, x_attn, layer->ln_2_g, layer->ln_2_b);
+    struct ggml_tensor *ln_2 = use_rmsnorm
+                                  ? apply_rmsnorm_affine(ctx0, x_attn, layer->ln_2_g)
+                                  : apply_layer_norm_affine(ctx0, x_attn, layer->ln_2_g, layer->ln_2_b);
     struct ggml_tensor *ff = build_ffn(ctx0, ln_2, layer);
     if (ff == NULL)
     {
@@ -1119,7 +1313,9 @@ static struct ggml_tensor *build_output_logits(
     struct ggml_tensor *x,
     const struct inference_global_tensors *g)
 {
-    struct ggml_tensor *x_norm = apply_layer_norm_affine(ctx0, x, g->ln_f_g, g->ln_f_b);
+    struct ggml_tensor *x_norm = (g->ln_f_b == NULL)
+                                     ? apply_rmsnorm_affine(ctx0, x, g->ln_f_g)
+                                     : apply_layer_norm_affine(ctx0, x, g->ln_f_g, g->ln_f_b);
     return mul_mat(ctx0, g->lm_head, x_norm, "lm_head * x");
 }
 
@@ -1499,8 +1695,21 @@ static void maybe_partition_runtime_graph(
     };
 
     bool partition_ok = false;
+    const int use_kahip = env_get_int_or_default("GGML_DISTRIB_USE_KAHIP", 0);
+    if (use_kahip != 0)
+    {
+        if (dist_partition_graph_kahip(&graph, &cfg, &result))
+        {
+            partition_ok = true;
+        }
+        else
+        {
+            printf("[distrib] KaHIP partitioning unavailable or failed, falling back\n");
+        }
+    }
+
     const int use_topology_tree = env_get_int_or_default("GGML_DISTRIB_TOPOLOGY_TREE", 0);
-    if (use_topology_tree != 0)
+    if (!partition_ok && use_topology_tree != 0)
     {
         dist_topology_tree_t tree = {0};
         if (dist_build_topology_tree_from_cgraph(gf, &tree))
@@ -1629,6 +1838,14 @@ bool run_batch_inference(struct model *model, const int *token_ids, int n_tokens
     }
 
     const struct inference_profile *profile = get_inference_profile(model);
+    if (profile == NULL)
+    {
+        printf("No compatible inference profile found for architecture=%s\n",
+               model->model_name != NULL ? model->model_name : "unknown");
+        printf("Expected one of fused-QKV or split-QKV naming conventions for attention/MLP tensors.\n");
+        return false;
+    }
+
     printf("Using inference profile: %s (architecture=%s)\n",
            profile->profile_name,
            model->model_name != NULL ? model->model_name : "unknown");
@@ -1655,8 +1872,17 @@ bool run_batch_inference(struct model *model, const int *token_ids, int n_tokens
         }
     }
 
+    int infer_ctx_mb = env_get_int_or_default("GGML_INFER_CTX_MB", 768);
+    if (infer_ctx_mb < 128)
+    {
+        infer_ctx_mb = 128;
+    }
+
+    // Reserve extra slack for graph expansion (notably GQA head expansion paths).
+    const int infer_ctx_slack_mb = 64;
+
     struct ggml_init_params params = {
-        .mem_size = 512 * 1024 * 1024,
+        .mem_size = (size_t)(infer_ctx_mb + infer_ctx_slack_mb) * 1024 * 1024,
         .mem_buffer = NULL,
         .no_alloc = false,
     };
@@ -1669,15 +1895,25 @@ bool run_batch_inference(struct model *model, const int *token_ids, int n_tokens
     }
 
     const int n_layer = model->hparams.n_layer;
-    const int n_ctx = model->hparams.n_ctx;
+    const int model_n_ctx = model->hparams.n_ctx;
     const int64_t n_embd = model->hparams.n_embd;
     const int64_t n_head = model->hparams.n_head;
 
-    if (n_past < 0 || n_past + n_tokens > n_ctx)
+    if (n_past < 0 || n_past + n_tokens > model_n_ctx)
     {
-        printf("Invalid sequence window: n_tokens=%d n_past=%d n_ctx=%d\n", n_tokens, n_past, n_ctx);
+        printf("Invalid sequence window: n_tokens=%d n_past=%d n_ctx=%d\n", n_tokens, n_past, model_n_ctx);
         ggml_free(ctx0);
         return false;
+    }
+
+    int kv_ctx = env_get_int_or_default("GGML_KV_CACHE_CTX", n_past + n_tokens);
+    if (kv_ctx < n_past + n_tokens)
+    {
+        kv_ctx = n_past + n_tokens;
+    }
+    if (kv_ctx > model_n_ctx)
+    {
+        kv_ctx = model_n_ctx;
     }
 
     if (n_head <= 0 || (n_embd % n_head) != 0)
@@ -1712,8 +1948,8 @@ bool run_batch_inference(struct model *model, const int *token_ids, int n_tokens
         printf("No absolute position embedding tensor found; using token embeddings only.\n");
     }
 
-    struct ggml_tensor *memory_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t)n_layer * n_ctx * n_embd);
-    struct ggml_tensor *memory_v = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t)n_layer * n_ctx * n_embd);
+    struct ggml_tensor *memory_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t)n_layer * kv_ctx * n_embd);
+    struct ggml_tensor *memory_v = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t)n_layer * kv_ctx * n_embd);
     memset(memory_k->data, 0, ggml_nbytes(memory_k));
     memset(memory_v->data, 0, ggml_nbytes(memory_v));
 
@@ -1728,7 +1964,7 @@ bool run_batch_inference(struct model *model, const int *token_ids, int n_tokens
             return false;
         }
 
-        x = run_transformer_block_single_token(ctx0, x, &layer, profile, n_embd, n_head, n_ctx, n_past, n_tokens, i, memory_k, memory_v, gf);
+        x = run_transformer_block_single_token(ctx0, x, &layer, profile, n_embd, n_head, kv_ctx, n_past, n_tokens, i, memory_k, memory_v, gf);
         if (x == NULL)
         {
             ggml_free(ctx0);

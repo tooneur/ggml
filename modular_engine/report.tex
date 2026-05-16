@@ -1,0 +1,285 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\geometry{margin=2.5cm}
+
+\title{Vers un moteur d'inf\'erence modulaire pour mod\`eles de langage}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Design}
+
+\subsection{Probl\'ematique}
+
+Les moteurs d'inf\'erence actuels, tels que \textit{llama.cpp}, offrent des performances robustes mais reposent majoritairement sur des organisations logicielles fortement coupl\'ees. Cette approche favorise l'efficacit\'e dans un cadre d'usage bien d\'efini, au prix d'une flexibilit\'e limit\'ee d\`es qu'il s'agit d'introduire de nouveaux sch\'emas de calcul, de nouvelles cibles mat\'erielles, ou des strat\'egies de distribution sp\'ecifiques.
+
+Dans ce contexte, notre probl\`eme de recherche peut \^etre formul\'e comme suit : \textit{comment concevoir un moteur d'inf\'erence qui conserve des performances comp\'etitives tout en permettant une composition explicite et extensible des composants de la cha\^ine d'ex\'ecution ?}
+
+\subsection{Limites des approches existantes}
+
+L'analyse des solutions existantes met en \`evidence quatre limitations principales.
+
+\begin{enumerate}[leftmargin=*]
+	\item \textbf{Couplage structurel \`a la pipeline d'inf\'erence.} Les \`etapes de chargement, d'optimisation et d'ex\'ecution sont souvent imbriqu\'ees, ce qui complique la substitution d'un composant isol\'e.
+	\item \textbf{Architecture impos\'ee.} Les outils contraignent l'utilisateur \`a adopter un sch\'ema d'ex\'ecution pr\'ed\'efini, limitant l'exploration de variantes algorithmiques ou syst\`emes.
+	\item \textbf{Co\^ut d'extension \'elev\'e.} L'ajout de nouveaux op\'erateurs, de nouvelles politiques de partitionnement ou de nouveaux backends implique fr\'equemment des modifications transversales du code.
+	\item \textbf{Faible testabilit\'e modulaire.} L'\'evaluation d'un composant isol\'e est difficile lorsque l'architecture impose l'ex\'ecution de la pipeline compl\`ete.
+\end{enumerate}
+
+\subsection{Hypoth\`ese de conception}
+
+Nous posons l'hypoth\`ese qu'une repr\'esentation interm\'ediaire explicite du calcul, sous forme de graphe orient\'e acyclique (DAG), constitue le bon niveau d'abstraction pour d\'ecoupler les responsabilit\'es du moteur.
+
+Cette hypoth\`ese conduit \`a trois choix structurants :
+
+\begin{itemize}[leftmargin=*]
+	\item \textbf{Abstraction du calcul.} Le mod\`ele est projet\'e vers une repr\'esentation DAG ind\'ependante du format source.
+	\item \textbf{S\'eparation du ``quoi'' et du ``o\`u''.} Le graphe encode les d\'ependances de calcul, tandis que les modules backend d\'efinissent l'ex\'ecution sur une cible mat\'erielle donn\'ee.
+	\item \textbf{Composabilit\'e des transformations.} Les politiques de partitionnement et d'optimisation sont d\'ecrites comme des transformations param\'etrables du graphe.
+\end{itemize}
+
+\subsection{Architecture modulaire propos\'ee}
+
+L'architecture est organis\'ee en quatre couches fonctionnelles :
+
+\begin{enumerate}[leftmargin=*]
+	\item \textbf{Ingestion mod\`ele} : chargement depuis un format source (e.g., GGUF).
+	\item \textbf{IR commune} : conversion vers un DAG unifi\'e (n\oe uds op\'erationnels, ar\^etes de donn\'ees).
+	\item \textbf{Optimisation/partitionnement} : application de strat\'egies de d\'ecoupage et d'ordonnancement.
+	\item \textbf{Ex\'ecution backend} : projection du plan d'ex\'ecution vers une ou plusieurs cibles (CPU, CUDA, Metal, etc.).
+\end{enumerate}
+
+Ce d\'ecouplage permet de faire \'evoluer une couche sans remettre en cause l'ensemble du syst\`eme, et facilite la comparaison contr\^ol\'ee de variantes d'impl\'ementation.
+
+\subsection{Objectifs de conception}
+
+Les objectifs associ\'es \`a cette proposition sont les suivants :
+
+\begin{itemize}[leftmargin=*]
+	\item fournir une interface d'inf\'erence extensible et stable ;
+	\item permettre le partitionnement explicite du graphe de calcul ;
+	\item r\'eduire le co\^ut d'int\'egration de nouveaux op\'erateurs et backends ;
+	\item am\'eliorer la testabilit\'e et la reproductibilit\'e exp\'erimentale.
+\end{itemize}
+
+\subsection{Synth\`ese}
+
+En r\'esum\'e, la contribution de design ne se limite pas \`a une optimisation locale de l'ex\'ecution, mais propose une structuration logicielle orient\'ee recherche et exp\'erimentation. Le DAG devient l'artefact central \`a partir duquel sont d\'eclin\'ees les d\'ecisions de partitionnement et d'ex\'ecution, ouvrant la voie \`a une \'evaluation comparative plus rigoureuse des strat\'egies d'inf\'erence modulaire.
+
+\section{Implementation}
+
+\subsection{Vue d'ensemble}
+
+L'impl\'ementation est r\'ealis\'ee sous forme de modules C/C++ faiblement coupl\'es, int\'egr\'es \`a GGML. Le choix d'une granularit\'e modulaire vise deux objectifs pratiques : (i) permettre la validation unitaire de chaque composant et (ii) faciliter l'\'evolution du moteur sans r\'e\'ecriture globale.
+
+Les principaux modules sont :
+\begin{itemize}[leftmargin=*]
+	\item \texttt{parser.c/.h} : chargement d'un mod\`ele GGUF et extraction des m\'etadonn\'ees ;
+	\item \texttt{distrib.c/.h} : repr\'esentation du graphe de partitionnement et heuristiques d'\'equilibrage ;
+	\item \texttt{dummy\_distrib.c} : baseline de partitionnement ;
+	\item \texttt{KaHIP.c} : interface de partitionnement avanc\'e via KaHIP ;
+	\item \texttt{parser\_main.c} : point d'entr\'ee exp\'erimental.
+\end{itemize}
+
+\subsection{Composant de parsing de mod\`ele}
+
+Le composant \texttt{parser} impl\'emente le chargement GGUF et instancie une structure de mod\`ele contenant le contexte GGML, le contexte GGUF, et les hyperparam\`etres utiles \`a l'inf\'erence.
+
+Fonctions d'int\'er\^et :
+\begin{itemize}[leftmargin=*]
+	\item \texttt{model\_load(...)} : validation du fichier et initialisation du mod\`ele ;
+	\item \texttt{run\_single\_token\_inference(...)} : ex\'ecution minimale pour v\'erification fonctionnelle ;
+	\item \texttt{run\_batch\_inference(...)} : ex\'ecution multi-tokens ;
+	\item \texttt{save\_logits(...)} : export des sorties pour comparaison.
+\end{itemize}
+
+Le format GGUF est exploit\'e comme format canonique d'entr\'ee. En pratique, le parseur suppose la disponibilit\'e d'un en-t\^ete coh\'erent (version, nombre de tenseurs, m\'etadonn\'ees) et de descripteurs de tenseurs correctement nomm\'es et typ\'es.
+
+\subsection{D\'etails du parseur GGUF}
+
+Le parseur est con\c{c}u pour (i) valider la structure du fichier, (ii) construire les tenseurs GGML correspondants et (iii) produire une repr\'esentation op\'erationnelle (DAG) exploitable par l'outil de partitionnement.
+
+Étapes principales :
+\begin{enumerate}[leftmargin=*]
+	\item Lire l'en-t\^ete GGUF et v\'erifier la magie/version.
+	\item Pour chaque descripteur de tenseur, allouer un \texttt{ggml\_tensor} et enregistrer son nom, sa forme et son type.
+	\item Construire la table de correspondance \textit{name -> tensor}\ pour retrouver un tenseur par ses noms alternatifs (ex: \texttt{"weight"} / \texttt{"W"}).
+	\item Construire le DAG de forward en parcourant la d\'ependance des op\'erateurs dans le contexte GGML (fonctions d'extraction d'alias et d'usage).
+\end{enumerate}
+
+Fonctions et points d'impl\'ementation notables :
+\begin{itemize}[leftmargin=*]
+	\item \texttt{find\_tensor\_any(...)} : renvoie le pointeur vers un tenseur existant parmi plusieurs noms candidats ; utile pour la robustesse vis-\`a-vis de variantes de dump.
+	\item \texttt{load\_required\_tensor\_any(...)} : m\'ethode d'abstraction pour v\'erifier et charger les tenseurs indispensables.
+\end{itemize}
+
+Exemple de heuristique de mappage : pour estimer la taille m\'emoire d'un tenseur on calcule
+\[
+\mathrm{bytes}(T) = \prod_{d\in \mathrm{dims}} d \times \mathrm{sizeof}(\text{type})
+\]
+et on stocke cette valeur comme attribut utilis\'e plus tard pour l'estimation des co\^uts de communication.
+
+\subsection{Construction du graphe de partitionnement}
+
+Le graphe de partitionnement est construits\'a partir du DAG d'ex\'ecution : chaque op\'eration devient un sommet avec un co\^ut de calcul estim\'e, et une ar\^ete est cr\'ee entre deux sommets si un tenseur produit par l'un est consomm\'e par l'autre.
+
+Calcul des co\^uts de sommet (co\^ut de calcul) : une estimation simple utilis\'ee dans l'impl\'ementation est
+\[
+C_{\mathrm{comp}}(v) = \frac{\mathrm{FLOPs}(v)}{\mathrm{peak\_flops}_{\mathrm{target}}},
+\]
+o\`u $\mathrm{FLOPs}(v)$ est une estimation du nombre d'op\'erations flottantes n\'ecessaires pour ex\'ecuter $v$ (par exemple, $2\times n \times m$ pour une multiplication matrice-vecteur). Le param\`etre $\mathrm{peak\_flops}_{\mathrm{target}}$ est fourni par l'utilisateur ou obtenu par profilage.
+
+Calcul des poids d'ar\^ete (co\^ut de communication) : pour une ar\^ete transportant un tenseur $T$ de taille $B$ octets,
+\[
+W_{\mathrm{comm}}(e) = \alpha + \frac{B}{\beta},
+\]
+o\`u $\alpha$ est la latence fixe (overhead) et $\beta$ la bande passante effective. Ces constantes peuvent \^etre estim\'ees \`a partir de micro-benchmarks.
+
+Pseudocode de construction :
+\begin{verbatim}
+for each op v in DAG:
+	comp_cost[v] = estimate_flops(v) / peak_flops
+	for each output tensor t of v:
+		for each consumer u of t:
+			add edge (v -> u) with weight = alpha + bytes(t)/bandwidth
+\end{verbatim}
+
+\subsection{Algorithmes de partitionnement}
+
+\paragraph{Baseline greedy (\texttt{dummy\_distrib})}
+
+La baseline impl\'ement\'ee est une heuristique de bin-packing gloutonne : on ordonne les sommets par co\^ut decroissant et on les assigne \`a la partition qui minimise l'augmentation de l'objectif $\mathcal{L}$. Cette strat\'egie est simple mais robuste pour les petits graphes.
+
+\paragraph{Partitionnement via KaHIP}
+
+Pour KaHIP, le graphe est converti en un format que KaHIP accepte (hypergraph/graph selon l'API), puis l'appel est d\'el\'egu\'e soit via l'API C, soit en invoquant l'ex\'ecutable. Le r\'esultat est une table \texttt{vertex\_to\_partition} qu'on r\'eimporte et utilise pour annoter le plan d'ex\'ecution.
+
+Fichier d'\'echange typique (graph): liste d'ar\^etes avec poids et nombre de sommets, suivie des poids de sommet.
+
+\subsection{Interface avec KaHIP (d\'etails)}
+
+L'int\'egration comporte deux variantes : (i) appel direct de la librairie KaHIP lors de la compilation, (ii) export du graphe sur disque et invocation du binaire KaHIP.
+
+Dans la voie ``API'', on construit les structures C attendues par KaHIP et on appelle \texttt{kaffpa\_interface(...)} (ou l'API appropri\'ee selon la version). Dans la voie binaire, on produit un fichier texte \texttt{graph.kt} et on ex\'ecute :
+\begin{verbatim}
+kahip --input=graph.kt --k=4 --preconfiguration=fast
+\end{verbatim}
+
+Ensuite, le fichier de sortie associant chaque sommet \`a une partition est pars\'e et copi\'e dans \texttt{vertex\_to\_partition}.
+
+\subsection{Tests, benchmarks et protocole de validation}
+
+Pour garantir la reproductibilit\'e, nous proposons un ensemble de tests unitaires et de micro-benchmarks :
+
+\begin{itemize}[leftmargin=*]
+	\item \textbf{Unitaires parser} : v\'erifier que le nombre de tenseurs lu correspond \`a la m\'etadonn\'ee et que les noms principaux existent (assertions sur \texttt{n\_tensors}, \texttt{hparams}).
+	\item \textbf{Tests de r\'egression logits} : ex\'ecuter \texttt{run\_single\_token\_inference} sur un contexte standard et comparer les logits aux valeurs de r\'ef\'erence (tol\'erance relative, p.ex. $10^{-5}$).
+	\item \textbf{Benchmarks} : \texttt{test\_perf} fournit le temps d'ex\'ecution simul\'e par sommet (en ms), la coupe inter-partitions estim\'ee et le ratio d'\'equilibre.
+\end{itemize}
+
+Commandes minimales :
+\begin{verbatim}
+mkdir -p build && cd build
+cmake .. -DGGML_USE_KAHIP=ON -DKAHIP_ROOT=/path/to/kahip-install
+cmake --build . --target parser test_perf model_compare
+// Run parser
+./build/parser sample_model.gguf
+// Run perf
+./build/test_perf sample_model.gguf
+\end{verbatim}
+
+Crit\`eres d'acceptation :
+\begin{itemize}[leftmargin=*]
+	\item charge-structure correcte (DAG sans cycles) ;
+	\item diff de logits entre r\'ef\'erence et impl\'ementation $<$ tol ;
+	\item partitions valides (aucun sommet non assign\'e), ratio d'\'equilibre raisonnable (p.ex. $<1.2$).
+\end{itemize}
+
+\subsection{Notes d'impl\'ementation et limites}
+
+Quelques choix d'impl\'ementation m\'eritent d'\^etre soulign\'es :
+\begin{itemize}[leftmargin=*]
+	\item l'estimation de FLOPs est approximative et d\'epend du type d'op\'eration ; une instrumentation runtime am\'eliore la pr\'ecision ;
+	\item la liaison avec KaHIP suppose une conversion correcte du graphe en structure accept\'ee ; cela peut impliquer une perte d'information sur les co\^uts d'ar\^etes si l'on utilise une repr\'esentation simplifi\'ee ;
+	\item l'impl\'ementation actuelle ne g\`ere pas les op\'erateurs dynamiques ni les boucles explicites ; ces cas n\'ecessitent une transformation pr\'ealable du graphe.
+\end{itemize}
+ 
+\end{document}
+\subsection{Composant de partitionnement}
+
+Le composant \texttt{distrib} transforme le graphe de calcul en graphe pond\'er\'e de partitionnement : les sommets repr\'esentent le co\^ut de calcul des op\'erations, et les ar\^etes repr\'esentent le co\^ut de communication entre op\'erations d\'ependantes.
+
+L'objectif optimis\'e est d\'efini par :
+\[
+\mathcal{L} = \lambda_{\mathrm{comm}}\,C_{\mathrm{cut}} + \lambda_{\mathrm{bal}}\,P_{\mathrm{balance}},
+\]
+o\`u $C_{\mathrm{cut}}$ est le co\^ut de coupe inter-partitions et $P_{\mathrm{balance}}$ la p\'enalit\'e de d\'es\'equilibre de charge. Cette formulation permet d'ajuster explicitement le compromis communication/\'equilibrage.
+
+La configuration de partitionnement inclut notamment : le nombre de partitions, les poids de l'objectif, un plafond de charge \textit{hard cap}, et des param\`etres d'it\'eration pour le raffinage local.
+
+\subsection{Int\'egration KaHIP}
+
+Le module \texttt{KaHIP.c} encapsule l'utilisation de KaHIP comme solveur externe de partitionnement. L'int\'egration est optionnelle au moment de la configuration CMake, ce qui permet de comparer deux r\'egimes :
+\begin{itemize}[leftmargin=*]
+	\item \textbf{baseline interne} (sans KaHIP) ;
+	\item \textbf{partitionnement avanc\'e} (avec KaHIP).
+\end{itemize}
+
+Cette dualit\'e constitue une base exp\'erimentale utile pour quantifier l'apport d'un partitionneur externe sur des graphes de tailles diff\'erentes.
+
+\subsection{D\'etails de reproductibilit\'e}
+
+\subsubsection{Pr\'erequis}
+\begin{itemize}[leftmargin=*]
+	\item compilateur C/C++ compatible C11/C++11 (GCC ou Clang) ;
+	\item CMake ;
+	\item GGML (inclus au d\'ep\^ot) ;
+	\item KaHIP optionnel, install\'e dans un pr\'efixe local (e.g., \texttt{third\_party/kahip-install}).
+\end{itemize}
+
+\subsubsection{Proc\'edure de compilation}
+
+\begin{verbatim}
+mkdir -p build
+cd build
+cmake .. -DGGML_USE_KAHIP=ON -DKAHIP_ROOT=/path/to/kahip-install
+cmake --build . --target parser
+\end{verbatim}
+
+En l'absence de KaHIP, la compilation reste possible avec \texttt{-DGGML\_USE\_KAHIP=OFF}.
+
+\subsubsection{Ex\'ecution minimale}
+
+\begin{verbatim}
+./build/parser model.gguf
+\end{verbatim}
+
+Cette commande produit : (i) une construction du DAG, (ii) des indicateurs de co\^ut de calcul/communication, et (iii) une proposition de partition (selon backend de partitionnement actif).
+
+\subsubsection{Protocole de validation}
+
+Pour reproduire les r\'esultats techniques de base, nous recommandons la s\'equence suivante :
+\begin{enumerate}[leftmargin=*]
+	\item v\'erifier le chargement du mod\`ele GGUF via \texttt{parser} ;
+	\item contr\^oler la coh\'erence des sorties (logits) sur un cas simple ;
+	\item ex\'ecuter les benchmarks (\texttt{test\_perf}) ;
+	\item comparer les strat\'egies de partitionnement (\texttt{model\_compare}).
+\end{enumerate}
+
+\subsection{Discussion d'impl\'ementation}
+
+L'impl\'ementation actuelle constitue un socle reproductible pour l'\'etude du partitionnement de graphes d'inf\'erence, mais ne couvre pas encore l'ex\'ecution distribu\'ee compl\`ete multi-backends. En cons\'equence, les r\'esultats obtenus \`a ce stade doivent \^etre interpr\'et\'es comme des r\'esultats de faisabilit\'e et de caract\'erisation, plut\^ot que comme une validation syst\`eme de bout en bout.
+
+\end{document}

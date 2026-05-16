@@ -9,12 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Portable qsort_r wrapper */
-#ifdef __GLIBC__
-#define HAVE_QSORT_R 1
-#else
-#define HAVE_QSORT_R 0
-#endif
 
 typedef struct {
 	int *out_begin;

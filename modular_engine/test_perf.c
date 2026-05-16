@@ -482,10 +482,7 @@ int main(int argc, char **argv) {
 		{.name = "kahip", .n_nodes = n_nodes, .use_topology_tree = 0, .use_kahip = 1},
 	};
 
-	int mode_count = 3;
-#ifdef GGML_USE_KAHIP
-	mode_count = 4;
-#endif
+	int mode_count = 4;
 
 	printf("Benchmark config: n_tokens=%d n_past=%d iterations=%d n_nodes=%d\n", n_tokens, n_past, n_iters, n_nodes);
 	printf("Warmup run (baseline) ...\n");
@@ -521,6 +518,25 @@ int main(int argc, char **argv) {
 			const double kahip_speedup = base / results[3].time_avg_s;
 			printf("Relative speedup vs baseline: kahip=%.3fx\n", kahip_speedup);
 		}
+	}
+
+	double best_comm_bytes = DBL_MAX;
+	const char *best_comm_mode = NULL;
+	for (int i = 0; i < mode_count; ++i) {
+		if (modes[i].n_nodes <= 1) {
+			continue;
+		}
+		if (results[i].comm_bytes_avg < best_comm_bytes) {
+			best_comm_bytes = results[i].comm_bytes_avg;
+			best_comm_mode = modes[i].name;
+		}
+	}
+
+	if (best_comm_mode != NULL) {
+		printf("\nBest observed inter-node transfer: %.2f MB/run (%s)\n",
+			   best_comm_bytes / (1024.0 * 1024.0),
+			   best_comm_mode);
+		printf("This is an empirical lower bound over tested partitioning modes, not a guaranteed global minimum.\n");
 	}
 
 	printf("Note: comm bytes are estimated from inter-partition edges in partition-plan.dot.\n");

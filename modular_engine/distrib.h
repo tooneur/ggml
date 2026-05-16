@@ -76,7 +76,7 @@ bool dist_partition_graph_balanced_min_cut(
     const dist_partition_config_t *config,
     dist_partition_result_t *result);
 
-// Partition using KaHIP when available at build time.
+// Partition using KaHIP 
 bool dist_partition_graph_kahip(
     const dist_graph_t *graph,
     const dist_partition_config_t *config,

@@ -241,33 +241,6 @@ Cette dualit\'e constitue une base exp\'erimentale utile pour quantifier l'appor
 
 \subsection{D\'etails de reproductibilit\'e}
 
-\subsubsection{Pr\'erequis}
-\begin{itemize}[leftmargin=*]
-	\item compilateur C/C++ compatible C11/C++11 (GCC ou Clang) ;
-	\item CMake ;
-	\item GGML (inclus au d\'ep\^ot) ;
-	\item KaHIP optionnel, install\'e dans un pr\'efixe local (e.g., \texttt{third\_party/kahip-install}).
-\end{itemize}
-
-\subsubsection{Proc\'edure de compilation}
-
-\begin{verbatim}
-mkdir -p build
-cd build
-cmake .. -DGGML_USE_KAHIP=ON -DKAHIP_ROOT=/path/to/kahip-install
-cmake --build . --target parser
-\end{verbatim}
-
-En l'absence de KaHIP, la compilation reste possible avec \texttt{-DGGML\_USE\_KAHIP=OFF}.
-
-\subsubsection{Ex\'ecution minimale}
-
-\begin{verbatim}
-./build/parser model.gguf
-\end{verbatim}
-
-Cette commande produit : (i) une construction du DAG, (ii) des indicateurs de co\^ut de calcul/communication, et (iii) une proposition de partition (selon backend de partitionnement actif).
-
 \subsubsection{Protocole de validation}
 
 Pour reproduire les r\'esultats techniques de base, nous recommandons la s\'equence suivante :

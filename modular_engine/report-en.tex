@@ -1,0 +1,257 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\geometry{margin=2.5cm}
+
+\title{Towards a Modular Inference Engine for Language Models}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Design}
+
+\subsection{Problem Statement}
+
+Current inference engines, such as \textit{llama.cpp}, provide robust performance but largely rely on tightly coupled software organizations. This approach favors efficiency within a well-defined usage framework, at the cost of limited flexibility when introducing new computation schemes, new hardware targets, or specific distribution strategies.
+
+In this context, our research problem can be formulated as follows: \textit{how can we design an inference engine that preserves competitive performance while enabling explicit and extensible composition of execution pipeline components?}
+
+\subsection{Limitations of Existing Approaches}
+
+The analysis of existing solutions highlights four major limitations.
+
+\begin{enumerate}[leftmargin=*]
+	\item \textbf{Structural coupling to the inference pipeline.} Loading, optimization, and execution stages are often intertwined, making it difficult to replace an isolated component.
+	\item \textbf{Imposed architecture.} Existing tools constrain the user to adopt a predefined execution scheme, limiting the exploration of algorithmic or system-level variants.
+	\item \textbf{High extension cost.} Adding new operators, partitioning policies, or backends frequently requires cross-cutting code modifications.
+	\item \textbf{Limited modular testability.} Evaluating an isolated component is difficult when the architecture requires execution of the full pipeline.
+\end{enumerate}
+
+\subsection{Design Hypothesis}
+
+We hypothesize that an explicit intermediate representation of computation, in the form of a directed acyclic graph (DAG), constitutes the appropriate abstraction level for decoupling engine responsibilities.
+
+This hypothesis leads to three structuring design choices:
+
+\begin{itemize}[leftmargin=*]
+	\item \textbf{Computation abstraction.} The model is projected into a DAG representation independent of the source format.
+	\item \textbf{Separation of ``what'' and ``where''.} The graph encodes computation dependencies, while backend modules define execution on a given hardware target.
+	\item \textbf{Composable transformations.} Partitioning and optimization policies are described as parameterizable graph transformations.
+\end{itemize}
+
+\subsection{Proposed Modular Architecture}
+
+The architecture is organized into four functional layers:
+
+\begin{enumerate}[leftmargin=*]
+	\item \textbf{Model ingestion}: loading from a source format (e.g., GGUF).
+	\item \textbf{Common IR}: conversion into a unified DAG (operational nodes, data edges).
+	\item \textbf{Optimization/partitioning}: application of decomposition and scheduling strategies.
+	\item \textbf{Backend execution}: projection of the execution plan onto one or several targets (CPU, CUDA, Metal, etc.).
+\end{enumerate}
+
+This decoupling enables the evolution of one layer without impacting the entire system and facilitates controlled comparison of implementation variants.
+
+\subsection{Design Objectives}
+
+The objectives associated with this proposal are the following:
+
+\begin{itemize}[leftmargin=*]
+	\item provide an extensible and stable inference interface;
+	\item enable explicit partitioning of the computation graph;
+	\item reduce the integration cost of new operators and backends;
+	\item improve testability and experimental reproducibility.
+\end{itemize}
+
+\subsection{Summary}
+
+In summary, the design contribution is not limited to local execution optimization, but instead proposes a software organization oriented toward research and experimentation. The DAG becomes the central artifact from which partitioning and execution decisions are derived, opening the way to a more rigorous comparative evaluation of modular inference strategies.
+
+\section{Implementation}
+
+\subsection{Overview}
+
+The implementation is developed as a set of loosely coupled C/C++ modules integrated with GGML. The choice of modular granularity serves two practical goals: (i) enabling unit-level validation of each component and (ii) facilitating engine evolution without requiring global rewrites.
+
+The main modules are:
+\begin{itemize}[leftmargin=*]
+	\item \texttt{parser.c/.h}: loading of a GGUF model and metadata extraction;
+	\item \texttt{distrib.c/.h}: representation of the partitioning graph and balancing heuristics;
+	\item \texttt{dummy\_distrib.c}: partitioning baseline;
+	\item \texttt{KaHIP.c}: advanced partitioning interface using KaHIP;
+	\item \texttt{parser\_main.c}: experimental entry point.
+\end{itemize}
+
+\subsection{Model Parsing Component}
+
+The \texttt{parser} component implements GGUF loading and instantiates a model structure containing the GGML context, the GGUF context, and the hyperparameters relevant to inference.
+
+Functions of interest:
+\begin{itemize}[leftmargin=*]
+	\item \texttt{model\_load(...)}: file validation and model initialization;
+	\item \texttt{run\_single\_token\_inference(...)}: minimal execution for functional verification;
+	\item \texttt{run\_batch\_inference(...)}: multi-token execution;
+	\item \texttt{save\_logits(...)}: output export for comparison.
+\end{itemize}
+
+The GGUF format is used as the canonical input format. In practice, the parser assumes the availability of a coherent header (version, number of tensors, metadata) and correctly named and typed tensor descriptors.
+
+\subsection{GGUF Parser Details}
+
+The parser is designed to (i) validate the file structure, (ii) construct the corresponding GGML tensors, and (iii) produce an operational representation (DAG) exploitable by the partitioning tool.
+
+Main stages:
+\begin{enumerate}[leftmargin=*]
+	\item Read the GGUF header and verify the magic/version.
+	\item For each tensor descriptor, allocate a \texttt{ggml\_tensor} and record its name, shape, and type.
+	\item Construct the \textit{name -> tensor} lookup table to retrieve a tensor from alternative names (e.g., \texttt{"weight"} / \texttt{"W"}).
+	\item Construct the forward DAG by traversing operator dependencies in the GGML context (alias and usage extraction functions).
+\end{enumerate}
+
+Notable functions and implementation details:
+\begin{itemize}[leftmargin=*]
+	\item \texttt{find\_tensor\_any(...)}: returns a pointer to an existing tensor among several candidate names; useful for robustness against dump variants.
+	\item \texttt{load\_required\_tensor\_any(...)}: abstraction method used to verify and load required tensors.
+\end{itemize}
+
+Example mapping heuristic: to estimate the memory size of a tensor, we compute
+\[
+\mathrm{bytes}(T) = \prod_{d\in \mathrm{dims}} d \times \mathrm{sizeof}(\text{type})
+\]
+and store this value as an attribute later used for communication cost estimation.
+
+\subsection{Construction of the Partitioning Graph}
+
+The partitioning graph is constructed from the execution DAG: each operation becomes a vertex associated with an estimated computation cost, and an edge is created between two vertices if a tensor produced by one is consumed by the other.
+
+Vertex cost computation (computation cost): a simple estimation used in the implementation is
+\[
+C_{\mathrm{comp}}(v) = \frac{\mathrm{FLOPs}(v)}{\mathrm{peak\_flops}_{\mathrm{target}}},
+\]
+where $\mathrm{FLOPs}(v)$ is an estimate of the number of floating-point operations required to execute $v$ (for example, $2\times n \times m$ for a matrix-vector multiplication). The parameter $\mathrm{peak\_flops}_{\mathrm{target}}$ is provided by the user or obtained through profiling.
+
+Edge weight computation (communication cost): for an edge carrying a tensor $T$ of size $B$ bytes,
+\[
+W_{\mathrm{comm}}(e) = \alpha + \frac{B}{\beta},
+\]
+where $\alpha$ is the fixed latency (overhead) and $\beta$ is the effective bandwidth. These constants may be estimated from micro-benchmarks.
+
+Construction pseudocode:
+\begin{verbatim}
+for each op v in DAG:
+	comp_cost[v] = estimate_flops(v) / peak_flops
+	for each output tensor t of v:
+		for each consumer u of t:
+			add edge (v -> u) with weight = alpha + bytes(t)/bandwidth
+\end{verbatim}
+
+\subsection{Partitioning Algorithms}
+
+\paragraph{Greedy baseline (\texttt{dummy\_distrib})}
+
+The implemented baseline is a greedy bin-packing heuristic: vertices are ordered by decreasing cost and assigned to the partition minimizing the increase in the objective $\mathcal{L}$. This strategy is simple but robust for small graphs.
+
+\paragraph{Partitioning with KaHIP}
+
+For KaHIP, the graph is converted into a format accepted by KaHIP (hypergraph/graph depending on the API), and the call is delegated either through the C API or by invoking the executable. The result is a \texttt{vertex\_to\_partition} table that is re-imported and used to annotate the execution plan.
+
+Typical exchange file (graph): edge list with weights and number of vertices, followed by vertex weights.
+
+\subsection{Interface with KaHIP (Details)}
+
+The integration includes two variants: (i) direct linking with the KaHIP library at compile time, and (ii) graph export to disk followed by invocation of the KaHIP binary.
+
+In the ``API'' path, the expected C structures are built and \texttt{kaffpa\_interface(...)} is called (or the appropriate API depending on the version). In the binary path, a text file \texttt{graph.kt} is produced and the following command is executed:
+\begin{verbatim}
+kahip --input=graph.kt --k=4 --preconfiguration=fast
+\end{verbatim}
+
+Then, the output file associating each vertex with a partition is parsed and copied into \texttt{vertex\_to\_partition}.
+
+\subsection{Tests, Benchmarks, and Validation Protocol}
+
+To guarantee reproducibility, we propose a set of unit tests and micro-benchmarks:
+
+\begin{itemize}[leftmargin=*]
+	\item \textbf{Parser unit tests}: verify that the number of tensors read matches the metadata and that the main names exist (assertions on \texttt{n\_tensors}, \texttt{hparams}).
+	\item \textbf{Logit regression tests}: execute \texttt{run\_single\_token\_inference} on a standard context and compare logits against reference values (relative tolerance, e.g., $10^{-5}$).
+	\item \textbf{Benchmarks}: \texttt{test\_perf} provides simulated execution time per vertex (in ms), estimated inter-partition cut, and balance ratio.
+\end{itemize}
+
+Minimal commands:
+\begin{verbatim}
+mkdir -p build && cd build
+cmake .. -DGGML_USE_KAHIP=ON -DKAHIP_ROOT=/path/to/kahip-install
+cmake --build . --target parser test_perf model_compare
+// Run parser
+./build/parser sample_model.gguf
+// Run perf
+./build/test_perf sample_model.gguf
+\end{verbatim}
+
+Acceptance criteria:
+\begin{itemize}[leftmargin=*]
+	\item correct load structure (acyclic DAG);
+	\item logit difference between reference and implementation $<$ tolerance;
+	\item valid partitions (no unassigned vertex), reasonable balance ratio (e.g., $<1.2$).
+\end{itemize}
+
+\subsection{Implementation Notes and Limitations}
+
+Several implementation choices deserve emphasis:
+\begin{itemize}[leftmargin=*]
+	\item FLOP estimation is approximate and depends on the operation type; runtime instrumentation improves precision;
+	\item the interface with KaHIP assumes correct graph conversion into an accepted structure; this may imply information loss regarding edge costs if a simplified representation is used;
+	\item the current implementation does not handle dynamic operators or explicit loops; such cases require prior graph transformation.
+\end{itemize}
+
+\subsection{Partitioning Component}
+
+The \texttt{distrib} component transforms the computation graph into a weighted partitioning graph: vertices represent the computational cost of operations, while edges represent the communication cost between dependent operations.
+
+The optimized objective is defined as:
+\[
+\mathcal{L} = \lambda_{\mathrm{comm}}\,C_{\mathrm{cut}} + \lambda_{\mathrm{bal}}\,P_{\mathrm{balance}},
+\]
+where $C_{\mathrm{cut}}$ is the inter-partition cut cost and $P_{\mathrm{balance}}$ is the load imbalance penalty. This formulation enables explicit adjustment of the communication/balancing trade-off.
+
+The partitioning configuration notably includes: the number of partitions, objective weights, a hard-cap load limit, and iteration parameters for local refinement.
+
+\subsection{KaHIP Integration}
+
+The \texttt{KaHIP.c} module encapsulates the use of KaHIP as an external partitioning solver. Integration is optional at CMake configuration time, allowing comparison between two regimes:
+\begin{itemize}[leftmargin=*]
+	\item \textbf{internal baseline} (without KaHIP);
+	\item \textbf{advanced partitioning} (with KaHIP).
+\end{itemize}
+
+This duality provides a useful experimental basis for quantifying the contribution of an external partitioner on graphs of different sizes.
+
+\subsection{Reproducibility Details}
+
+\subsubsection{Validation Protocol}
+
+To reproduce the baseline technical results, we recommend the following sequence:
+\begin{enumerate}[leftmargin=*]
+	\item verify GGUF model loading via \texttt{parser};
+	\item validate output consistency (logits) on a simple case;
+	\item execute benchmarks (\texttt{test\_perf});
+	\item compare partitioning strategies (\texttt{model\_compare}).
+\end{enumerate}
+
+\subsection{Implementation Discussion}
+
+The current implementation constitutes a reproducible foundation for studying inference graph partitioning, but does not yet cover full distributed multi-backend execution. Consequently, the results obtained at this stage should be interpreted as feasibility and characterization results rather than as a complete end-to-end system validation.
+
+\end{document}
